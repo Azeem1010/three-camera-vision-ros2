@@ -1,0 +1,77 @@
+# usb_cam（ros-jazzy-usb-cam）三顆鏡頭的共同參數：MJPG、640x480、30 FPS。
+# video_device 由 launch 以 cameras.yaml / launch 參數填入；camera_name 與 camera_info_url 也由 launch 設定。
+#
+# 影像 topic（不可自行開 /dev/video，視覺節點只訂閱這些 topic）：
+#   /env_cam/image_raw   /arm1_cam/image_raw   /arm2_cam/image_raw
+#
+# 建議：顏色分割很吃光線穩定度。調好 HSV 後，把自動白平衡/自動曝光關掉並鎖定手動值
+# （把 auto_white_balance / autoexposure 改為 false，再設 white_balance / exposure），
+# 並確認相機支援這些控制項（待實測）。
+/env_cam/usb_cam:
+  ros__parameters:
+    video_device: ""
+    framerate: 30.0
+    io_method: "mmap"
+    frame_id: "env_cam"
+    pixel_format: "mjpeg2rgb"       # MJPG 解碼成 rgb8
+    av_device_format: "YUV422P"
+    image_width: 640
+    image_height: 480
+    camera_name: "env_cam"
+    brightness: -1
+    contrast: -1
+    saturation: -1
+    sharpness: -1
+    gain: -1
+    auto_white_balance: true
+    white_balance: 4600
+    autoexposure: true
+    exposure: 100
+    autofocus: false
+    focus: -1
+
+/arm1_cam/usb_cam:
+  ros__parameters:
+    video_device: ""
+    framerate: 30.0
+    io_method: "mmap"
+    frame_id: "arm1_cam"
+    pixel_format: "mjpeg2rgb"
+    av_device_format: "YUV422P"
+    image_width: 640
+    image_height: 480
+    camera_name: "arm1_cam"
+    brightness: -1
+    contrast: -1
+    saturation: -1
+    sharpness: -1
+    gain: -1
+    auto_white_balance: true
+    white_balance: 4600
+    autoexposure: true
+    exposure: 100
+    autofocus: false
+    focus: -1
+
+/arm2_cam/usb_cam:
+  ros__parameters:
+    video_device: ""
+    framerate: 30.0
+    io_method: "mmap"
+    frame_id: "arm2_cam"
+    pixel_format: "mjpeg2rgb"
+    av_device_format: "YUV422P"
+    image_width: 640
+    image_height: 480
+    camera_name: "arm2_cam"
+    brightness: -1
+    contrast: -1
+    saturation: -1
+    sharpness: -1
+    gain: -1
+    auto_white_balance: true
+    white_balance: 4600
+    autoexposure: true
+    exposure: 100
+    autofocus: false
+    focus: -1

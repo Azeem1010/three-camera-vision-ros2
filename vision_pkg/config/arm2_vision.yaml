@@ -1,0 +1,62 @@
+# 手眼相機 2 節點 arm2_vision_node 參數（手臂 2 在 Home_C 待機觀測 C 區）
+# 標示「待實測」的數值尚未量測，僅為合理預設，請上線後調整。
+/**:
+  ros__parameters:
+    image_topic: /arm2_cam/image_raw
+    show_debug: true
+    process_hz: 10.0
+    image_timeout_s: 1.0
+    service_timeout_s: 2.0      # 待實測
+    calib_dir: ''
+    hsv_reload_period_s: 2.0
+    undistort: false
+    intrinsics_file: ''         # 空字串 = <calib_dir>/arm2_cam_intrinsics.yaml
+
+    # ---- C 區定位與透視校正 ----
+    c_zone_color: c_zone        # 使用 hsv.yaml 的哪一個顏色（待實測，預設白色）
+    c_station_size_mm: [200.0, 200.0]   # 校正後座標系的 [x(格位 4 欄方向), y(2 排方向)] 長度（待實測）
+    warp_px_per_mm: 2.0
+    warp_rotation_k: 0          # 0..3：校正後影像「上排」要是靠近 B 區那一排。看 debug 視窗調整（待實測）
+    corner_median_frames: 5     # C 區角點取最近幾次偵測的中位數（抗抖動）
+    corner_hold_s: 3.0          # 偵測暫時失敗時，沿用上次角點的最長秒數，超過就回報失敗
+    zone_mask:
+      blur_ksize: 5
+      open_ksize: 5
+      close_ksize: 9
+    zone_find:
+      min_area_px: 8000.0
+      approx_eps_min: 0.02
+      approx_eps_max: 0.08
+      approx_eps_steps: 7
+      min_quad_fill: 0.70       # 物件壓到站台邊緣會缺角，比 env 放寬
+      allow_rect_fallback: true
+
+    # ---- 格位 ----
+    orange_mask:
+      blur_ksize: 5
+      open_ksize: 3
+      close_ksize: 5
+    grid:
+      rows: 2
+      cols: 4
+      margin_ratio: 0.05        # 占用比例計算時每格四邊內縮比例
+      occupied_threshold: 0.3   # 橘色像素比例 >= 此值判定占用（待實測，預設 0.3）
+    square:                     # 單位：C 區校正後像素（用於量各格物件邊長）
+      min_area_px: 600.0
+      max_area_px: 14000.0
+      approx_eps_ratio: 0.04
+      max_aspect: 1.25
+      min_fill: 0.80
+      reject_border_touch: true
+      border_px: 2
+      side_method: rect
+    ranker:
+      type: relative
+      confidence_margin_px: 3.0 # 單位：C 區校正後像素
+      table_mm: [20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0]  # 僅 absolute_table 使用（待實測）
+      table_tolerance_mm: 1.5
+
+    # ---- 放置座標高度（手臂 2 基座座標，公尺 = (站台高度 + 物件高度) / 1000） ----
+    place:
+      station_height_mm: 0.0    # 待實測
+      object_height_mm: 30.0    # 待實測

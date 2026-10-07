@@ -1,0 +1,11 @@
+# /vision/env/capture_ranking
+# 批次開始時拍快照：8 個物件須全在 A 區；量測邊長並由小到大給 rank 1..8，
+# 以 A 站平面座標（mm）保存各物件中心。偵測數量不是 8 個時失敗，不猜測。
+---
+bool success
+# 成功時說明最小相鄰邊長差；失敗時說明原因（數量不符、被排除的區塊等）
+string message
+# 實際偵測到的正方形數量
+int32 count
+# 相鄰 rank 的邊長差小於排序信心門檻時為 true（建議人工確認或重新擺放）
+bool low_confidence

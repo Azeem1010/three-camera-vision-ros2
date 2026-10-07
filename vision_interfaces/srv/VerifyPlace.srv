@@ -1,0 +1,13 @@
+# /vision/arm2/verify_place
+# 驗證放置：指定格位是否已有物件，以及「已占用格位」的邊長是否隨格位編號遞增。
+# 要檢查的格位編號 1..8
+int32 slot
+---
+# 該格是否已放置物件（橘色像素比例 >= 門檻）
+bool placed
+# 所有已占用格位的邊長是否隨編號嚴格遞增（相對排序檢查）
+bool order_ok
+# 排錯的格位編號（取最長遞增子序列以外者）；order_ok 為 true 時為空
+int32[] wrong_slots
+bool success
+string message

@@ -1,0 +1,9 @@
+# 手眼相機 2：影像像素 (u, v) -> 手臂 2 基座座標 (x, y)，單位 公尺。（空範本，待標定）
+# 標定：ros2 run vision_pkg calibrate_homography --target arm2
+# 標定結果寫入 <calib_dir>/arm2_homography.yaml（優先於本檔）。valid=false 時 get_grid_state 會回報失敗。
+valid: false
+unit: m
+H:
+- [1.0, 0.0, 0.0]
+- [0.0, 1.0, 0.0]
+- [0.0, 0.0, 1.0]

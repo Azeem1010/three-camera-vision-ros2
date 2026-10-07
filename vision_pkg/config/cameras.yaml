@@ -1,0 +1,15 @@
+# 三顆鏡頭的裝置路徑（待實測）。
+# 查詢指令： ls /dev/v4l/by-id/
+# 請使用 by-id 的穩定路徑（例如 /dev/v4l/by-id/usb-XXXX_Camera-video-index0），
+# 不要用 /dev/video0 之類會隨插拔順序改變的名稱。
+#
+# 也可以改用 launch 參數覆寫（優先於本檔）：
+#   ros2 launch vision_pkg vision.launch.py env_cam_device:=/dev/v4l/by-id/... \
+#       arm1_cam_device:=/dev/v4l/by-id/... arm2_cam_device:=/dev/v4l/by-id/...
+# 兩處皆留空時，launch 會印出錯誤提示並略過該鏡頭（其他鏡頭與節點照常啟動）。
+env_cam:
+  video_device: ""
+arm1_cam:
+  video_device: ""
+arm2_cam:
+  video_device: ""

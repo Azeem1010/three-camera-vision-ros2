@@ -1,0 +1,14 @@
+# /vision/arm2/get_grid_state
+# C 區 2x4 格位狀態。格位編號 1..8：上排（靠近 B 區）1–4，下排 5–8，各排由左至右。
+# 陣列索引 i 對應格位 i+1。
+---
+bool[8] occupied
+# 各格中心的手臂 2 基座座標（公尺），索引同上
+float64[8] place_x
+float64[8] place_y
+float64[8] place_z
+# 8 格皆已占用
+bool all_full
+# false 時（影像逾時、C 區定位失敗、arm2_homography 未標定…）座標不可採信
+bool success
+string message

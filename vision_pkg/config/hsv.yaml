@@ -1,0 +1,36 @@
+# HSV 色彩範圍（OpenCV 格式：H 0-179、S 0-255、V 0-255）
+#
+# 這是「預設值」，實際以 hsv_tuner.py 調整後的結果為準：
+#   ros2 run vision_pkg hsv_tuner --topic /env_cam/image_raw --color blue
+# hsv_tuner 按 's' 存檔時寫入 <calib_dir>/hsv.yaml（預設 ~/.ros/vision_calib/hsv.yaml），
+# 它會逐色「覆寫」本檔的同名項目；節點每 hsv_reload_period_s 秒自動重新載入，不必重啟。
+#
+# H 下限 > H 上限 代表色相環繞（例如紅色：lower H=170, upper H=10）。
+# 注意：木頭桌面（H≈10–20，S≈100–170）與橘色物件色相接近，請用較高的 S/V 下限區分，
+#       並以 hsv_tuner 在實際光源下確認。
+
+# A 區站台：藍色（待實測）
+blue:
+  lower: [95, 100, 50]
+  upper: [130, 255, 255]
+
+# B 區站台：綠色（待實測）
+green:
+  lower: [40, 80, 50]
+  upper: [85, 255, 255]
+
+# C 區站台顏色：預設白色（低飽和度、高亮度）。顏色尚未定案，待實測；
+# 若 C 區換成其他顏色，用 hsv_tuner --color c_zone 調整即可，不必改程式。
+c_zone:
+  lower: [0, 0, 190]
+  upper: [179, 50, 255]
+
+# 橘色正方體（待實測）。S 下限刻意設高，避免把木頭桌面當成橘色。
+orange:
+  lower: [5, 150, 140]
+  upper: [22, 255, 255]
+
+# 黑色（手臂）（待實測）
+black:
+  lower: [0, 0, 0]
+  upper: [179, 255, 60]

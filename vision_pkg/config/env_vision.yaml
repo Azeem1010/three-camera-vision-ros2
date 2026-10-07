@@ -1,0 +1,82 @@
+# 環境相機節點 env_vision_node 參數
+# 標示「待實測」的數值尚未量測，僅為合理預設，請上線後以實際場地調整。
+/**:
+  ros__parameters:
+    image_topic: /env_cam/image_raw
+    show_debug: true            # debug 視窗；launch 的 show_debug:=false 可關閉。沒有 DISPLAY 時自動停用
+    process_hz: 10.0            # 持續判斷的頻率
+    image_timeout_s: 1.0        # 最新影像/結果超過這個秒數視為過期（影像中斷）
+    service_timeout_s: 2.0      # 所有 service 的等待逾時（待實測）
+    calib_dir: ''               # 空字串 = 環境變數 VISION_CALIB_DIR，再不然 ~/.ros/vision_calib
+    hsv_reload_period_s: 2.0    # 檢查 hsv.yaml 是否被 hsv_tuner 更新的週期
+    undistort: false            # 是否用內參去畸變（要先跑 calibrate_intrinsics；標定 homography 時須一致）
+    intrinsics_file: ''         # 空字串 = <calib_dir>/env_cam_intrinsics.yaml
+
+    # ---- 站台定位（開機時桌面淨空） ----
+    boot_locate_frames: 5       # 開機/重新定位時取幾張影格做逐點中位數
+    boot_min_detections: 3      # 其中至少幾張偵測到才採用
+    boot_wait_s: 10.0           # 開機後等待影像的最長秒數，逾時改讀上次存檔
+    min_baseline_ratio: 0.5     # 淨空時站台顏色佔 ROI 的比例下限；低於代表 HSV 不對或站台有遮擋
+    roi_erode_px: 4             # ROI 向內收縮像素（避開站台邊緣的桌面/陰影）
+    zone_color:                 # 各區使用 hsv.yaml 的哪一個顏色
+      a: blue
+      b: green
+      c: c_zone                 # C 區顏色待實測（預設白色）
+    zone_size_mm:               # 站台實際尺寸 [寬, 高]（待實測，預設 200x200）
+      a: [200.0, 200.0]
+      b: [200.0, 200.0]
+      c: [200.0, 200.0]
+    zone_mask:                  # 站台色分割的遮罩前處理
+      blur_ksize: 5
+      open_ksize: 5
+      close_ksize: 9
+    zone_find:
+      min_area_px: 5000.0       # 站台色塊最小面積（像素²）
+      approx_eps_min: 0.02
+      approx_eps_max: 0.08
+      approx_eps_steps: 7
+      min_quad_fill: 0.75
+      allow_rect_fallback: true
+
+    # ---- 持續判斷：各區有無物件 / B 區手臂 ----
+    orange_mask:
+      blur_ksize: 5
+      open_ksize: 3
+      close_ksize: 5
+    black_mask:
+      blur_ksize: 5
+      open_ksize: 5
+      close_ksize: 7
+    occupancy:
+      occ_ratio_thresh: 0.02    # 站台色被遮擋比例 >= 此值判定有東西（主要依據）（待實測）
+      orange_ratio_thresh: 0.004  # 區內橘色比例 >= 此值判定有物件（輔助）（待實測）
+      black_ratio_thresh: 0.15  # 區內黑色比例 >= 此值視為大面積黑色（手臂）（待實測）
+      green_drop_ratio: 0.6     # B 區綠色可見面積 <= 基準的此比例視為驟降（待實測）
+    debounce:                   # 去彈跳（以處理週期為單位）
+      object_frames: 3          # 物件有/無 需連續幾次相同才切換
+      arm_present_frames: 1     # 偵測到手臂：立刻採信（安全優先）
+      arm_clear_frames: 5       # 手臂離開：需連續幾次確認才回報 clear
+    c_count:
+      min_blob_area_mm2: 150.0  # C 區橘色塊小於此面積不計（待實測）
+      median_frames: 5          # 計數取最近幾次的中位數
+
+    # ---- 批次快照（capture_ranking / get_rank） ----
+    snapshot:
+      warp_px_per_mm: 2.0       # A 區透視校正解析度（排序信心門檻的「像素」即此校正圖像素）
+      avg_frames: 3             # 拍快照時平均幾張新影格以降雜訊
+      expected_count: 8
+    square:                     # 單位：A 區校正後像素（待實測）
+      min_area_px: 600.0
+      max_area_px: 14000.0
+      approx_eps_ratio: 0.04
+      max_aspect: 1.15
+      min_fill: 0.85
+      reject_border_touch: true
+      border_px: 4
+      side_method: rect         # rect = minAreaRect 長寬平均；area = sqrt(面積)
+    ranker:
+      type: relative            # relative = 相對排序；absolute_table = 絕對尺寸對照表（日後替換，節點不用改）
+      confidence_margin_px: 3.0 # 排序信心門檻，單位為校正後像素（待實測，預設 3）
+      table_mm: [20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0]  # 僅 absolute_table 使用（待實測）
+      table_tolerance_mm: 1.5
+    match_threshold_mm: 20.0    # get_rank 配對距離門檻（待實測，預設 20 mm）

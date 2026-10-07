@@ -1,0 +1,16 @@
+# /vision/arm1/get_pick_target
+# 手臂 1 在 Home_A 姿態拍攝 A 區，回傳要夾取物件的手臂 1 基座座標（公尺）。
+# 協調器指定的 rank；0 = 預設取目前看得到的 rank 最小者
+int32 target_rank
+# false（預設）：回傳目標後通知環境相機把該物件標記為「已取走」
+# true：只查詢，不標記（重試同一物件、或只想預覽時使用）
+bool peek_only
+---
+bool success
+# 失敗原因：影像逾時、同伴服務逾時、配對失敗、超出可達範圍、homography 未標定…
+string message
+int32 rank
+# 手臂 1 基座座標（公尺）。z = 站台高度 + 物件高度
+float64 x
+float64 y
+float64 z

@@ -1,0 +1,14 @@
+# /vision/env/get_zone_state
+# 回傳環境相機最新一次的區域狀態判斷。
+---
+# A 區是否有物件（站台顏色被遮擋為主、橘色像素為輔）
+bool a_has_object
+# B 區是否有物件
+bool b_has_object
+# B 區是否沒有手臂（true = 手臂已離開，可進入）。無法判斷時一律 false（保守）
+bool b_arm_clear
+# C 區（環境相機視角）橘色物件塊數
+int32 c_object_count
+# false 表示影像逾時 / 站台未定位等；此時上面各欄位不可採信
+bool success
+string message

@@ -1,0 +1,39 @@
+# 手眼相機 1 節點 arm1_vision_node 參數（手臂 1 在 Home_A 待機觀測 A 區）
+# 標示「待實測」的數值尚未量測，僅為合理預設，請上線後調整。
+/**:
+  ros__parameters:
+    image_topic: /arm1_cam/image_raw
+    show_debug: true
+    process_hz: 10.0
+    image_timeout_s: 1.0
+    service_timeout_s: 2.0      # get_pick_target 的總逾時（含呼叫 env 服務），待實測
+    env_call_timeout_s: 2.0     # 單次呼叫 /vision/env/get_rank 的逾時，待實測
+    calib_dir: ''
+    hsv_reload_period_s: 2.0
+    undistort: false
+    intrinsics_file: ''         # 空字串 = <calib_dir>/arm1_cam_intrinsics.yaml
+
+    # A 站平面（a_station_homography.yaml 的輸出座標系）
+    a_station_size_mm: [200.0, 200.0]   # 待實測
+    roi_margin_mm: 0.0          # 偵測範圍相對站台向外（正）/向內（負）擴張的 mm 數
+
+    # 目標座標高度（手臂 1 基座座標，公尺 = (站台高度 + 物件高度) / 1000）
+    station_height_mm: 0.0      # 待實測
+    object_height_mm: 30.0      # 待實測
+    reach:                      # 手臂 1 可達範圍：基座座標 xy 半徑（待實測）
+      min_m: 0.05
+      max_m: 0.35
+
+    orange_mask:
+      blur_ksize: 5
+      open_ksize: 5
+      close_ksize: 7
+    square:                     # 單位：手眼相機原始影像像素（待實測；cube 在影像中的大小隨相機高度而異）
+      min_area_px: 500.0
+      max_area_px: 14000.0
+      approx_eps_ratio: 0.04
+      max_aspect: 1.25          # 手眼相機有透視，比環境相機放寬
+      min_fill: 0.80
+      reject_border_touch: true
+      border_px: 2
+      side_method: rect

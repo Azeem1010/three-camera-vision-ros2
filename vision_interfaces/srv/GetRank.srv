@@ -1,0 +1,16 @@
+# /vision/env/get_rank
+# 輸入 A 站平面座標（原點為站台左上角，x 向右、y 向下，單位 mm），
+# 以最近距離配對 capture_ranking 快照中「尚未取走」的物件並回傳 rank。
+float64 x_mm
+float64 y_mm
+# false（預設）：配對成功後把該物件標記為「已取走」，之後不再被配對（避免重複配對）
+# true：只查詢，不標記
+bool peek_only
+---
+bool success
+# 配對失敗時說明原因（超過配對門檻、已被取走、尚未拍快照…）
+string message
+# 配對到的 rank（1 = 最小）；失敗時為 0
+int32 rank
+# 與配對物件中心的距離（mm）
+float64 distance_mm

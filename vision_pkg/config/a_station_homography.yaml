@@ -1,0 +1,10 @@
+# 手眼相機 1：影像像素 (u, v) -> A 站平面座標 (x, y)，單位 毫米。（空範本，待標定）
+# A 站平面：原點為站台左上角，x 向右、y 向下，以環境相機俯視方向為準。
+# 標定：ros2 run vision_pkg calibrate_homography --target a_station
+# 標定結果寫入 <calib_dir>/a_station_homography.yaml（優先於本檔）。
+valid: false
+unit: mm
+H:
+- [1.0, 0.0, 0.0]
+- [0.0, 1.0, 0.0]
+- [0.0, 0.0, 1.0]

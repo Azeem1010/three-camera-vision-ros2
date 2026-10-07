@@ -1,0 +1,7 @@
+# 環境相機的 A/B/C 站台角點（空範本）。
+# env_vision_node 在開機（桌面淨空）或呼叫 /vision/env/recalibrate_zones 時，
+# 會把偵測到的角點寫入 <calib_dir>/zones.yaml（預設 ~/.ros/vision_calib/zones.yaml），
+# 之後沿用該 ROI；偵測失敗時讀取上次存檔並記錄警告。本檔只是尚未標定時的預設。
+version: 1
+valid: false
+zones: {}
