@@ -91,6 +91,34 @@ SRV = {
 Trigger = _srv('Trigger', {}, dict(_OK))
 
 
+class Header:
+    def __init__(self):
+        self.stamp, self.frame_id = None, ''
+
+
+def _with_header(name, fields):
+    """含 std_msgs/Header 的訊息：header 不做型別檢查，其餘欄位照常嚴格檢查。"""
+    cls = _cls(name, fields)
+    init = cls.__init__
+
+    def __init__(self, **kw):
+        init(self, **kw)
+        object.__setattr__(self, 'header', Header())
+    cls.__init__ = __init__
+    return cls
+
+
+MSG = {
+    'PickTarget': _with_header('PickTarget', {
+        'rank': ('int', 0), 'x': ('float', 0.0), 'y': ('float', 0.0), 'z': ('float', 0.0),
+        'visible_ranks': ('int[]', []), **_OK}),
+    'GridState': _with_header('GridState', {
+        'occupied': ('bool[8]', [False] * 8), 'place_x': ('float[8]', [0.0] * 8),
+        'place_y': ('float[8]', [0.0] * 8), 'place_z': ('float[8]', [0.0] * 8),
+        'all_full': ('bool', False), **_OK}),
+}
+
+
 class Image:
     def __init__(self, height=0, width=0, encoding='', step=0, data=b''):
         self.height, self.width, self.encoding, self.step, self.data = height, width, encoding, step, data
@@ -174,6 +202,13 @@ class FakeClient:
     def remove_pending_request(self, fut): self.removed += 1
 
 
+class FakePublisher:
+    def __init__(self, topic):
+        self.topic, self.msgs = topic, []
+
+    def publish(self, msg): self.msgs.append(msg)
+
+
 class FakeNode:
     overrides: dict = {}    # 測試在建立節點前先放入 {節點名稱: {參數名: 值}}
 
@@ -181,7 +216,7 @@ class FakeNode:
         self.node_name = node_name
         self._params = dict(FakeNode.overrides.get(node_name, {}))
         self._logger = FakeLogger()
-        self.subs, self.timers, self.services, self.clients = [], [], {}, {}
+        self.subs, self.timers, self.services, self.clients, self.publishers = [], [], {}, {}, {}
 
     def get_logger(self): return self._logger
     def list_parameters(self, prefixes, depth): return SimpleNamespace(names=list(self._params))
@@ -199,6 +234,14 @@ class FakeNode:
     def create_service(self, srv_type, name, cb, callback_group=None):
         self.services[name] = cb
         return object()
+
+    def create_publisher(self, msg_type, topic, qos):
+        p = FakePublisher(topic)
+        self.publishers[topic] = p
+        return p
+
+    def get_clock(self):
+        return SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: 'stamp'))
 
     def create_client(self, srv_type, name, callback_group=None):
         c = FakeClient(srv_type, name, callback_group)
@@ -230,5 +273,6 @@ def install() -> None:
     mod('sensor_msgs.msg', Image=Image)
     mod('std_srvs', srv=None)
     mod('std_srvs.srv', Trigger=Trigger)
-    mod('vision_interfaces', srv=None)
+    mod('vision_interfaces', srv=None, msg=None)
     mod('vision_interfaces.srv', **SRV)
+    mod('vision_interfaces.msg', **MSG)

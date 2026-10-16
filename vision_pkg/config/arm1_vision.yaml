@@ -14,7 +14,7 @@
     intrinsics_file: ''         # 空字串 = <calib_dir>/arm1_cam_intrinsics.yaml
 
     # A 站平面（a_station_homography.yaml 的輸出座標系）
-    a_station_size_mm: [200.0, 200.0]   # 待實測
+    a_station_size_mm: [200.0, 300.0]   # A 區 20x30 cm（與 env 的 A 區平面一致：x 向右 200、y 向下 300）
     roi_margin_mm: 0.0          # 偵測範圍相對站台向外（正）/向內（負）擴張的 mm 數
 
     # 目標座標高度（手臂 1 基座座標，公尺 = (站台高度 + 物件高度) / 1000）

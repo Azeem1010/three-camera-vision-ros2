@@ -14,7 +14,7 @@
 
     # ---- C 區定位與透視校正 ----
     c_zone_color: c_zone        # 使用 hsv.yaml 的哪一個顏色（待實測，預設白色）
-    c_station_size_mm: [200.0, 200.0]   # 校正後座標系的 [x(格位 4 欄方向), y(2 排方向)] 長度（待實測）
+    c_station_size_mm: [300.0, 200.0]   # 校正後座標系的 [x(格位 4 欄方向), y(2 排方向)] 長度；C 區 20x30 cm -> 每格 75x100 mm
     warp_px_per_mm: 2.0
     warp_rotation_k: 0          # 0..3：校正後影像「上排」要是靠近 B 區那一排。看 debug 視窗調整（待實測）
     corner_median_frames: 5     # C 區角點取最近幾次偵測的中位數（抗抖動）

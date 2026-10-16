@@ -9,6 +9,8 @@
 Services
   /vision/arm2/get_grid_state   occupied[8]、各格放置座標、all_full
   /vision/arm2/verify_place     指定格位是否已放置、已占用格位的邊長是否隨編號遞增、排錯的格位
+Topic
+  /vision/arm2/grid_state       （vision_interfaces/GridState）以 process_hz 持續發布，內容同 get_grid_state
 
 格位編號：上排（靠近 B 區）1–4，下排 5–8，各排由左至右。校正後影像的「上排」要對應到
 靠近 B 區那一排，由參數 warp_rotation_k（0..3）決定，請看 debug 視窗確認。
@@ -32,6 +34,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from vision_interfaces.msg import GridState
 from vision_interfaces.srv import GetGridState, VerifyPlace
 
 from vision_pkg import calib_io
@@ -105,6 +108,8 @@ class Arm2VisionNode(Node):
         self.create_timer(1.0 / self.cfg.process_hz, self._on_tick, callback_group=g_proc)
         self.create_service(GetGridState, '/vision/arm2/get_grid_state', self._srv_grid_state, callback_group=g_srv)
         self.create_service(VerifyPlace, '/vision/arm2/verify_place', self._srv_verify, callback_group=g_srv)
+        self.pub_grid = self.create_publisher(GridState, '/vision/arm2/grid_state', 10)
+        self.create_timer(1.0 / self.cfg.process_hz, self._on_publish, callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(f'arm2_vision_node 就緒，訂閱 {self.P.s("image_topic")}')
 
     # ------------------------------------------------------------------ #
@@ -234,33 +239,58 @@ class Arm2VisionNode(Node):
             return None
         return res
 
+    def _fill_grid(self, out, res: GridResult) -> None:
+        """把有效結果填進 GetGridState 回應或 GridState 訊息（兩者欄位名稱相同）。"""
+        out.occupied = [bool(o) for o in res.occupied]
+        out.all_full = all(res.occupied)
+        if res.base_xy is None:
+            out.success = False
+            out.message = ('arm2_homography 尚未標定（valid=false 或讀取失敗），無法提供放置座標；'
+                           '請執行 ros2 run vision_pkg calibrate_homography --target arm2')
+            return
+        z = (self.cfg.station_height_mm + self.cfg.object_height_mm) / 1000.0
+        out.place_x = [float(v) for v in res.base_xy[:, 0]]
+        out.place_y = [float(v) for v in res.base_xy[:, 1]]
+        out.place_z = [z] * N_SLOTS
+        out.success = True
+        out.message = '占用比例: ' + ' '.join(f'{i + 1}:{r:.2f}' for i, r in enumerate(res.ratios))
+
+    @staticmethod
+    def _grid_defaults(out) -> None:
+        out.occupied = [False] * N_SLOTS
+        out.place_x = [0.0] * N_SLOTS
+        out.place_y = [0.0] * N_SLOTS
+        out.place_z = [0.0] * N_SLOTS
+        out.all_full = False
+
     def _srv_grid_state(self, req, resp):
-        resp.occupied = [False] * N_SLOTS
-        resp.place_x = [0.0] * N_SLOTS
-        resp.place_y = [0.0] * N_SLOTS
-        resp.place_z = [0.0] * N_SLOTS
-        resp.all_full = False
+        self._grid_defaults(resp)
         try:
             res = self._get_result(resp)
-            if res is None:
-                return resp
-            resp.occupied = [bool(o) for o in res.occupied]
-            resp.all_full = all(res.occupied)
-            if res.base_xy is None:
-                resp.success = False
-                resp.message = ('arm2_homography 尚未標定（valid=false 或讀取失敗），無法提供放置座標；'
-                                '請執行 ros2 run vision_pkg calibrate_homography --target arm2')
-                return resp
-            z = (self.cfg.station_height_mm + self.cfg.object_height_mm) / 1000.0
-            resp.place_x = [float(v) for v in res.base_xy[:, 0]]
-            resp.place_y = [float(v) for v in res.base_xy[:, 1]]
-            resp.place_z = [z] * N_SLOTS
-            resp.success = True
-            resp.message = '占用比例: ' + ' '.join(f'{i + 1}:{r:.2f}' for i, r in enumerate(res.ratios))
+            if res is not None:
+                self._fill_grid(resp, res)
         except Exception as e:
             self.get_logger().error('get_grid_state 例外:\n' + traceback.format_exc())
             resp.success, resp.message = False, f'內部錯誤: {e!r}'
         return resp
+
+    def _on_publish(self) -> None:
+        """以處理頻率發布最新格位狀態；影像中斷/定位失敗時照樣發布 success=false 與原因。"""
+        try:
+            msg = GridState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'arm2_base'
+            self._grid_defaults(msg)
+            res, why = self.results.wait_fresh(self.cfg.image_timeout_s, 0.0)
+            if res is None:
+                msg.success, msg.message = False, why
+            elif not res.valid:
+                msg.success, msg.message = False, res.message
+            else:
+                self._fill_grid(msg, res)
+            self.pub_grid.publish(msg)
+        except Exception:
+            self.get_logger().error('grid_state 發布例外:\n' + traceback.format_exc(), throttle_duration_sec=5.0)
 
     def _srv_verify(self, req, resp):
         resp.placed, resp.order_ok, resp.wrong_slots = False, False, []
@@ -333,7 +363,7 @@ def main(args=None):
     code = 0
     try:
         node = Arm2VisionNode()
-        executor = MultiThreadedExecutor(num_threads=4)
+        executor = MultiThreadedExecutor(num_threads=5)   # 影像 / 處理 / service / 發布 各一組 + 餘裕
         executor.add_node(node)
         spin_node(rclpy, node, executor, node.show_debug, 'arm2_vision')
     except (KeyError, ValueError) as e:

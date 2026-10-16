@@ -2,8 +2,10 @@
 import numpy as np
 import synthetic as S
 
-from vision_pkg.vision_core.color_zone import (HsvRange, MaskParams, find_zone, fuse_corners,
-                                               hsv_mask, locate_zones)
+from vision_pkg.vision_core.color_zone import (FieldParams, HsvRange, MaskParams, ZoneFindParams, find_field,
+                                               find_zone, fuse_corners, hsv_mask, locate_field_zones,
+                                               locate_zones, split_field)
+from vision_pkg.vision_core.params_util import dataclass_from_flat
 
 
 def _ranges(hsv):
@@ -53,6 +55,59 @@ def test_locate_flags_low_baseline(env_scenes, env_cfg, hsv):
     res = locate_zones([env_scenes['empty']] * 3, {'a': hsv['blue']}, env_cfg['zone_mp'], env_cfg['zone_find'],
                        1, env_cfg['erode'], 1.01)  # 可見比例最大就是 1，設 >1 必定觸發
     assert not res['a'].ok and '基準' in res['a'].message
+
+
+# --------------------------------------------------------------------------- #
+# field 模式：黑色外框場地均分成 A|B|C
+# --------------------------------------------------------------------------- #
+def _field_args(flat, hsv, **fp_over):
+    fp = dataclass_from_flat(FieldParams, flat, 'field')
+    fp = FieldParams(**{**fp.__dict__, **fp_over})
+    ranges = {z: hsv[flat[f'zone_color.{z}']] for z in 'abc'}
+    return (hsv['black'], ranges, dataclass_from_flat(MaskParams, flat, 'field_mask'),
+            dataclass_from_flat(MaskParams, flat, 'zone_mask'), dataclass_from_flat(ZoneFindParams, flat, 'zone_find'),
+            fp, flat['field.size_mm'], int(flat['boot_min_detections']), int(flat['roi_erode_px']),
+            float(flat['min_baseline_ratio']))
+
+
+def _expected_zones():
+    return split_field(S.FIELD_CORNERS, S.FIELD_SIZE_MM, 'abc')
+
+
+def test_field_mode_splits_outer_frame_into_three_zones(field_flat, hsv):
+    res = locate_field_zones([S.make_field_scene()] * 5, *_field_args(field_flat, hsv))
+    exp = _expected_zones()
+    for z in 'abc':
+        assert res[z].ok, f'{z}: {res[z].message}'
+        err = np.abs(res[z].corners - exp[z]).max()
+        assert err < 3.0, f'{z} 角點誤差 {err:.2f}px'
+        assert res[z].baseline > 0.8, f'{z} 基準（分隔線/外框應被 ROI 內縮排除）{res[z].baseline:.2f}'
+    assert res['a'].corners[:, 0].mean() < res['b'].corners[:, 0].mean() < res['c'].corners[:, 0].mean()
+
+
+def test_field_mode_inner_edge_and_reverse(field_flat, hsv):
+    res = locate_field_zones([S.make_field_scene()] * 5, *_field_args(field_flat, hsv, edge='inner'))
+    assert all(res[z].ok for z in 'abc')
+    b = S.FIELD_BORDER_MM * 566 / 600          # 外框線寬約幾像素：內緣應比外緣往內縮
+    assert res['a'].corners[0][0] > S.FIELD_CORNERS[0][0] + 0.5 * b
+    rev = locate_field_zones([S.make_field_scene()] * 5, *_field_args(field_flat, hsv, reverse=True))
+    assert rev['a'].corners[:, 0].mean() > rev['c'].corners[:, 0].mean()   # C|B|A
+
+
+def test_field_mode_fails_with_reason(field_flat, hsv):
+    blank = S.make_field_scene()
+    blank[:] = S.WOOD
+    res = locate_field_zones([blank] * 5, *_field_args(field_flat, hsv))
+    assert all(not res[z].ok and '外框' in res[z].message for z in 'abc')
+    tall = np.ascontiguousarray(np.rot90(S.make_field_scene()))   # 相機轉 90°：外框變直的
+    res = locate_field_zones([tall] * 5, *_field_args(field_flat, hsv))
+    assert not res['a'].ok and '橫向' in res['a'].message
+
+
+def test_find_field_outer_corners(field_flat, hsv):
+    zr, _ = find_field(S.make_field_scene(), hsv['black'], dataclass_from_flat(MaskParams, field_flat, 'field_mask'),
+                       dataclass_from_flat(ZoneFindParams, field_flat, 'zone_find'), 'outer')
+    assert zr.found and np.abs(zr.corners - S.FIELD_CORNERS).max() < 3.0
 
 
 def test_fuse_corners_uses_median_and_min_count():

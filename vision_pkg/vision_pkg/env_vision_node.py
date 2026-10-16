@@ -44,9 +44,9 @@ from vision_pkg import calib_io
 from vision_pkg.debug_draw import draw_poly, put_text
 from vision_pkg.node_common import (Debouncer, FlatParams, FrameBuffer, LatestValue,
                                     image_msg_to_bgr, read_ros_params, spin_node)
-from vision_pkg.vision_core.color_zone import (HsvRange, MaskParams, OccupancyParams, ZoneFindParams,
+from vision_pkg.vision_core.color_zone import (FieldParams, HsvRange, MaskParams, OccupancyParams, ZoneFindParams,
                                                ZoneRoi, count_blobs, judge_arm_present, judge_object_present,
-                                               locate_zones, make_roi, measure_zones)
+                                               locate_field_zones, locate_zones, make_roi, measure_zones)
 from vision_pkg.vision_core.geometry import polygon_area
 from vision_pkg.vision_core.size_ranker import SizeRanker, make_ranker
 from vision_pkg.vision_core.snapshot import ObjectInfo, capture_snapshot, match_object
@@ -155,7 +155,21 @@ class EnvVisionNode(Node):
         c.min_baseline = P.f('min_baseline_ratio')
         c.erode = P.i('roi_erode_px')
         c.zone_color = {z: P.s(f'zone_color.{z}') for z in ZONES}
-        c.zone_size = {z: tuple(P.fl(f'zone_size_mm.{z}')) for z in ZONES}
+        c.locate_mode = P.s('zone_locate_mode')
+        if c.locate_mode not in ('field', 'color'):
+            raise ValueError(f'zone_locate_mode 必須是 field 或 color（目前 {c.locate_mode!r}）')
+        if c.locate_mode == 'field':
+            c.field = P.group(FieldParams, 'field')
+            if c.field.edge not in ('outer', 'inner'):
+                raise ValueError(f'field.edge 必須是 outer 或 inner（目前 {c.field.edge!r}）')
+            c.field_size = tuple(P.fl('field.size_mm'))
+            if len(c.field_size) != 2 or min(c.field_size) <= 0:
+                raise ValueError('field.size_mm 必須是兩個正數 [寬, 高]')
+            c.field_mp = P.group(MaskParams, 'field_mask')
+            # 各區尺寸由外框均分而來（只有一個來源，不會和 zone_size_mm 對不上）
+            c.zone_size = {z: (c.field_size[0] / len(ZONES), c.field_size[1]) for z in ZONES}
+        else:
+            c.zone_size = {z: tuple(P.fl(f'zone_size_mm.{z}')) for z in ZONES}
         for z, s in c.zone_size.items():
             if len(s) != 2 or min(s) <= 0:
                 raise ValueError(f'zone_size_mm.{z} 必須是兩個正數 [寬, 高]')
@@ -243,7 +257,11 @@ class EnvVisionNode(Node):
         if ranges is None:
             return False, why
         c = self.cfg
-        res = locate_zones(frames, ranges, c.zone_mp, c.zone_find, c.boot_min_det, c.erode, c.min_baseline)
+        if c.locate_mode == 'field':
+            res = locate_field_zones(frames, self.hsv.value['black'], ranges, c.field_mp, c.zone_mp, c.zone_find,
+                                     c.field, c.field_size, c.boot_min_det, c.erode, c.min_baseline)
+        else:
+            res = locate_zones(frames, ranges, c.zone_mp, c.zone_find, c.boot_min_det, c.erode, c.min_baseline)
         saved = None
         msgs, all_ok, any_new = [], True, False
         with self._lock:

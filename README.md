@@ -1,7 +1,8 @@
 # 雙機械手臂協同搬運系統 — 視覺（三顆鏡頭 / OpenCV / ROS 2 Jazzy）
 
 只負責視覺：環境相機、手眼相機 1（Home_A）、手眼相機 2（Home_C）。任務協調器與手臂控制由其他組員負責，
-彼此**只透過 ROS service** 溝通（不使用自訂 topic）。不使用深度學習，OpenCV 用 apt 版（4.6 API）。
+彼此主要透過 **ROS service** 溝通；手眼相機另外以 10 Hz 發布 topic（`/vision/arm1/pick_target`、`/vision/arm2/grid_state`，
+內容同對應 service，見第 3 節）。不使用深度學習，OpenCV 用 apt 版（4.6 API）。
 
 ```
  usb_cam /env_cam ──► env_vision_node  ──► /vision/env/{recalibrate_zones,get_zone_state,capture_ranking,get_rank,clear_taken}
@@ -134,6 +135,16 @@ ros2 service call /vision/arm2/get_grid_state   vision_interfaces/srv/GetGridSta
 ros2 service call /vision/arm2/verify_place     vision_interfaces/srv/VerifyPlace "{slot: 3}"
 ```
 
+Topic（以 `process_hz` 持續發布；失敗時照樣發布 `success=false` 與原因，`header.stamp` 可判斷是否還活著）：
+
+```bash
+ros2 topic echo /vision/arm1/pick_target   # vision_interfaces/msg/PickTarget：rank 最小的目標 + 基座 x/y/z（只查詢，不標記已取走）
+ros2 topic echo /vision/arm2/grid_state    # vision_interfaces/msg/GridState：同 get_grid_state
+```
+
+`pick_target` 等同持續呼叫 `get_pick_target(target_rank=0, peek_only=true)`。**它不會標記「已取走」**：真正要夾取時，
+仍要呼叫一次 `get_pick_target`（peek_only=false），否則物件還在畫面上時無法區分「已取走」與「還沒取」。
+
 典型一輪：`capture_ranking`（批次開始，8 個物件都在 A 區）→ 每次取件前 `get_pick_target(target_rank=k)`
 → 手臂 1 搬運（B 區進出前看 `get_zone_state.b_arm_clear`）→ 手臂 2 放入 C 區後 `verify_place(slot=k)`。
 
@@ -179,8 +190,8 @@ ros2 launch vision_pkg vision.launch.py \
    `ros2 run vision_pkg calibrate_intrinsics --camera env --cols 9 --rows 6 --square-mm 25`（arm1、arm2 同理）。
    存成 camera_info 格式 `<calib_dir>/<cam>_cam_intrinsics.yaml`，launch 會自動帶給 usb_cam。若決定啟用去畸變：
    launch 加 `undistort:=true`，**之後 calibrate_homography 也要加 `--undistort`，兩邊必須一致**（先決定再標 homography）。
-4. **HSV 調整**：`ros2 run vision_pkg hsv_tuner --camera env --color blue`（鍵 1–5 切 blue/green/c_zone/orange/black，`s` 存）。
-   env 相機調 blue、green、c_zone、orange、black；再到 arm1/arm2 影像確認 orange、c_zone 也可用。節點自動重新載入，不必重啟。
+4. **HSV 調整**：`ros2 run vision_pkg hsv_tuner --camera env --color black`（鍵 1–5 切 blue/green/c_zone/orange/black，`s` 存）。
+   env 相機調 black（外框）、c_zone（白色內部）、orange；再到 arm1/arm2 影像確認 orange、c_zone 也可用。節點自動重新載入，不必重啟。
 5. **把實測值填進 config**（目前都是預設值，YAML 內已標「待實測」）：站台尺寸 `zone_size_mm`/`a_station_size_mm`/`c_station_size_mm`、
    `object_height_mm`/`station_height_mm`、`reach.min_m/max_m`、`match_threshold_mm`、`ranker.confidence_margin_px`、
    `grid.occupied_threshold`、逾時。
@@ -211,8 +222,12 @@ launch 內的 usb_cam 設定（執行檔 `usb_cam_node_exe`、`pixel_format: mjp
 - homography 只對應「一個平面」。立方體頂面比站台高，視差會讓座標偏移（相機離中心越遠、物件越高越明顯）。
   標定點請放在物件頂面高度；環境相機與手眼相機 1 的視差不同，若 `get_rank` 回報的 `distance_mm` 常接近門檻，
   請放寬 `match_threshold_mm`（但要小於物件最小間距的一半）或把環境相機裝高、接近正俯視。
-- 預設三站台都是 200×200 mm，C 區 2×4 格因此是 **50×100 mm 的長方形格**。占用判斷是「橘色像素 / 格內面積 ≥ 0.3」，
-  這代表小立方體（邊長 < ≈38 mm）在這種格子裡會被判成未占用。請依實際格位尺寸調 `c_station_size_mm` 與 `grid.occupied_threshold`。
+- **場地（env，`zone_locate_mode: field`）**：60×30 cm 黑色外框、內部白色，由左至右 A|B|C 各 20×30 cm。env 找黑框
+  （`field.edge` = outer 量外緣 / inner 量內緣），在場地平面上均分三區；`roi_erode_px` 要大於框線/分隔線在影像中的寬度。
+  相機須讓場地在影像中是橫向；若影像中是 C|B|A 設 `field.reverse: true`。舊的「三塊彩色站台」做法改 `zone_locate_mode: color`。
+- C 區 20×30 cm 切 2×4 格，`c_station_size_mm: [300, 200]`，每格 **75×100 mm**。占用判斷是「橘色像素 / 格內面積 ≥ 0.3」，
+  這代表小立方體（邊長 < ≈48 mm）在這種格子裡會被判成未占用。請依實際物件尺寸調 `grid.occupied_threshold`。
+- arm2 以白色找 C 區外框：若 C 區和 B 區之間**沒有黑色分隔線**，白色會連成一片，C 區會定位錯誤（請確認場地有分隔線）。
 - 手眼相機假設手臂**停在 Home 姿態**。節點不知道手臂在哪裡，手臂移動中的畫面會產生錯誤結果；協調器應在手臂到位、穩定
   （建議 ≥ 0.3 s）後再呼叫。
 

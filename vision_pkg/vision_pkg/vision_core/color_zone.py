@@ -7,7 +7,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .geometry import order_corners, polygon_area, polygon_mask
+from .geometry import apply_homography, order_corners, polygon_area, polygon_mask
 
 
 # --------------------------------------------------------------------------- #
@@ -44,6 +44,14 @@ class ZoneFindParams:
     approx_eps_steps: int
     min_quad_fill: float        # 輪廓面積 / 四邊形面積 的下限，太低代表形狀不像矩形
     allow_rect_fallback: bool   # approxPolyDP 湊不出 4 點時是否改用 minAreaRect
+
+
+@dataclass(frozen=True)
+class FieldParams:
+    """外框定位參數（zone_locate_mode=field：找整個場地的黑色外框，再沿長邊均分成各區）。"""
+    edge: str                   # 'outer' = 黑框外緣即場地邊界；'inner' = 黑框內緣（框內白色區域）即場地邊界
+    min_aspect: float           # 外框 寬/高 下限；場地在影像中必須是橫向（A|B|C 由左至右）
+    reverse: bool               # true = 影像中由左至右為 C|B|A
 
 
 @dataclass(frozen=True)
@@ -292,17 +300,114 @@ def locate_zones(frames: Sequence[np.ndarray], zone_ranges: Dict[str, HsvRange],
             out[name] = LocateResult(False, None, 0.0,
                                      f'{len(found)}/{len(frames)} 張偵測到（至少需 {min_detections}）：{why}')
             continue
-        roi = make_roi(frames[0].shape, corners, roi_erode_px)
-        vis = [cv2.countNonZero(cv2.bitwise_and(hsv_mask(f, rng, mp), roi.mask)) / max(1, roi.area)
-               for f in frames]
-        baseline = float(np.median(vis))
-        if baseline < min_baseline:
-            out[name] = LocateResult(False, corners, baseline,
-                                     f'淨空基準可見比例 {baseline:.2f} < {min_baseline:.2f}'
-                                     '（HSV 設定不對，或站台上有東西遮擋，請淨空後重試）')
-            continue
-        out[name] = LocateResult(True, corners, baseline, f'ok（{len(found)}/{len(frames)} 張，基準 {baseline:.2f}）')
+        out[name] = _with_baseline(frames, corners, rng, mp, roi_erode_px, min_baseline,
+                                   f'{len(found)}/{len(frames)} 張')
     return out
+
+
+def _with_baseline(frames: Sequence[np.ndarray], corners: np.ndarray, rng: HsvRange, mp: MaskParams,
+                   roi_erode_px: int, min_baseline: float, note: str) -> LocateResult:
+    """算出淨空時站台顏色佔 ROI 的基準比例；太低代表 HSV 不對或有東西遮擋。"""
+    roi = make_roi(frames[0].shape, corners, roi_erode_px)
+    vis = [cv2.countNonZero(cv2.bitwise_and(hsv_mask(f, rng, mp), roi.mask)) / max(1, roi.area)
+           for f in frames]
+    baseline = float(np.median(vis))
+    if baseline < min_baseline:
+        return LocateResult(False, corners, baseline,
+                            f'淨空基準可見比例 {baseline:.2f} < {min_baseline:.2f}'
+                            '（HSV 設定不對，或站台上有東西遮擋，請淨空後重試）')
+    return LocateResult(True, corners, baseline, f'ok（{note}，基準 {baseline:.2f}）')
+
+
+# --------------------------------------------------------------------------- #
+# 外框定位：整個場地一個黑色外框，沿長邊均分成 A|B|C
+# --------------------------------------------------------------------------- #
+def find_field(bgr: np.ndarray, black: HsvRange, mp: MaskParams, zp: ZoneFindParams,
+               edge: str) -> Tuple[ZoneResult, np.ndarray]:
+    """找出場地黑色外框的四個角點。回傳 (結果, 黑色遮罩)。
+
+    edge='outer'：取最大黑色輪廓的外緣（框內有分隔線也不影響）。
+    edge='inner'：取該輪廓所有內洞（框內白色區域，有分隔線時為多個）的凸包。
+    """
+    mask = hsv_mask(bgr, black, mp)
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = -1, float(zp.min_area_px)
+    for i, c in enumerate(cnts):
+        a = cv2.contourArea(c)
+        if hier[0][i][3] == -1 and a >= best_area:
+            best, best_area = i, a
+    if best < 0:
+        return ZoneResult(False, None, 0.0, '', f'找不到面積 >= {zp.min_area_px:.0f} px² 的黑色外框'), mask
+    if edge == 'inner':
+        holes = [cnts[i] for i in range(len(cnts))
+                 if hier[0][i][3] == best and cv2.contourArea(cnts[i]) >= 0.02 * best_area]
+        if not holes:
+            return ZoneResult(False, None, 0.0, '', '黑色外框沒有封閉的內部區域（框線有斷開？可改用 edge=outer）'), mask
+        contour = cv2.convexHull(np.vstack(holes))
+        area_c = float(sum(cv2.contourArea(h) for h in holes))
+    else:
+        contour = cnts[best]
+        area_c = float(best_area)
+    quad, method = quad_from_contour(contour, zp)
+    if quad is None:
+        return ZoneResult(False, None, 0.0, '', 'approxPolyDP 無法取得外框的 4 個角點'), mask
+    area_q = polygon_area(quad)
+    fill = area_c / area_q if area_q > 0 else 0.0
+    if fill < zp.min_quad_fill:
+        return ZoneResult(False, None, area_c, method,
+                          f'外框不像矩形（輪廓/四邊形面積比 {fill:.2f} < {zp.min_quad_fill:.2f}）'), mask
+    return ZoneResult(True, quad, area_c, method, ''), mask
+
+
+def split_field(corners: np.ndarray, field_size_mm: Sequence[float], names: Sequence[str]) -> Dict[str, np.ndarray]:
+    """把場地四角點（tl,tr,br,bl）沿寬度方向均分成 len(names) 區，回傳各區影像角點（tl,tr,br,bl）。
+
+    以透視轉換在場地平面上等分，所以斜拍時各區在影像中的寬度不同也沒關係。
+    """
+    W, H = float(field_size_mm[0]), float(field_size_mm[1])
+    to_img = cv2.getPerspectiveTransform(np.float32([[0, 0], [W, 0], [W, H], [0, H]]),
+                                         np.asarray(corners, np.float32))
+    n = len(names)
+    out: Dict[str, np.ndarray] = {}
+    for i, name in enumerate(names):
+        x0, x1 = W * i / n, W * (i + 1) / n
+        out[name] = apply_homography(to_img, [[x0, 0], [x1, 0], [x1, H], [x0, H]]).astype(np.float32)
+    return out
+
+
+def locate_field_zones(frames: Sequence[np.ndarray], black: HsvRange, zone_ranges: Dict[str, HsvRange],
+                       field_mp: MaskParams, zone_mp: MaskParams, zp: ZoneFindParams, fp: FieldParams,
+                       field_size_mm: Sequence[float], min_detections: int, roi_erode_px: int,
+                       min_baseline: float) -> Dict[str, LocateResult]:
+    """用多張影格（桌面淨空）找場地外框，均分成各區，並算出各區基準可見比例。
+
+    zone_ranges 的順序即影像中由左至右的順序（fp.reverse=True 時反過來）。
+    外框找不到時所有區一起失敗；基準比例則逐區判斷。
+    """
+    names = list(zone_ranges)
+    found, reasons = [], []
+    for f in frames:
+        zr, _ = find_field(f, black, field_mp, zp, fp.edge)
+        if zr.found:
+            found.append(zr.corners)
+        else:
+            reasons.append(zr.reason)
+    corners = fuse_corners(found, min_detections)
+    if corners is None:
+        why = reasons[0] if reasons else '無影格'
+        msg = f'外框 {len(found)}/{len(frames)} 張偵測到（至少需 {min_detections}）：{why}'
+        return {n: LocateResult(False, None, 0.0, msg) for n in names}
+    tl, tr, br, bl = corners
+    w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
+    h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
+    if w < fp.min_aspect * h:
+        msg = (f'外框在影像中不是橫向（寬/高 {w / max(h, 1e-6):.2f} < {fp.min_aspect:.2f}）；'
+               '請轉正環境相機，讓 A|B|C 在影像中由左至右排列')
+        return {n: LocateResult(False, corners, 0.0, msg) for n in names}
+    zones = split_field(corners, field_size_mm, names[::-1] if fp.reverse else names)
+    note = f'外框 {len(found)}/{len(frames)} 張'
+    return {n: _with_baseline(frames, zones[n], zone_ranges[n], zone_mp, roi_erode_px, min_baseline, note)
+            for n in names}
 
 
 def measure_zones(bgr: np.ndarray, rois: Dict[str, ZoneRoi], zone_ranges: Dict[str, HsvRange],

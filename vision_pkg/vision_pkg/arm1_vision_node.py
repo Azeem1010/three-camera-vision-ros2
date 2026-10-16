@@ -9,6 +9,8 @@
       - 取協調器指定的 target_rank（0 = 預設取 rank 最小者）
       - 以 arm1_homography 轉成手臂 1 基座座標（m），z = 站台高度 + 物件高度
       - 檢查可達範圍；peek_only=false 時通知環境相機把該物件標記為「已取走」
+  * /vision/arm1/pick_target（topic，vision_interfaces/PickTarget）：以 process_hz 持續發布
+    rank 最小的目標，算法同 get_pick_target(target_rank=0, peek_only=true)，不會標記已取走
 
 執行緒模型（避免 service 內呼叫 service 死鎖）：
   MultiThreadedExecutor；影像 / 處理計時器 / service 伺服端 / env 服務 client 各自放在
@@ -33,6 +35,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from vision_interfaces.msg import PickTarget
 from vision_interfaces.srv import GetPickTarget, GetRank
 
 from vision_pkg import calib_io
@@ -51,6 +54,18 @@ class Detection:
     squares: List[Blob]
     rejected: List[Blob]
     roi_poly: Optional[np.ndarray]    # A 區在影像中的範圍（需 a_station_homography 有效）
+
+
+@dataclass
+class Target:
+    rank: int
+    x: float                # 手臂 1 基座座標 m
+    y: float
+    z: float
+    plane_x: float          # A 站平面座標 mm（標記已取走時要用）
+    plane_y: float
+    visible: List[int]      # 畫面中配對得到的所有 rank
+    message: str
 
 
 class Arm1VisionNode(Node):
@@ -89,16 +104,20 @@ class Arm1VisionNode(Node):
             except Exception as e:
                 self.get_logger().error(f'undistort=true 但讀不到內參 {path}: {e}；改用原始影像（與標定不一致時結果會有誤）')
 
-        # 四個 callback group：影像 / 處理計時器 / service 伺服端 / env 服務 client
+        # 五個 callback group：影像 / 處理計時器 / service 伺服端 / topic 發布計時器 / env 服務 client
+        # （發布計時器也要呼叫 env 服務，獨立一組才不會擋住影像處理或 service）
         g_img = MutuallyExclusiveCallbackGroup()
         g_proc = MutuallyExclusiveCallbackGroup()
         g_srv = MutuallyExclusiveCallbackGroup()
+        g_pub = MutuallyExclusiveCallbackGroup()
         g_cli = MutuallyExclusiveCallbackGroup()
         self.create_subscription(Image, self.P.s('image_topic'), self._on_image, qos_profile_sensor_data,
                                  callback_group=g_img)
         self.create_timer(1.0 / self.cfg.process_hz, self._on_tick, callback_group=g_proc)
         self.cli_rank = self.create_client(GetRank, '/vision/env/get_rank', callback_group=g_cli)
         self.create_service(GetPickTarget, '/vision/arm1/get_pick_target', self._srv_pick, callback_group=g_srv)
+        self.pub_target = self.create_publisher(PickTarget, '/vision/arm1/pick_target', 10)
+        self.create_timer(1.0 / self.cfg.process_hz, self._on_publish, callback_group=g_pub)
         self.get_logger().info(f'arm1_vision_node 就緒，訂閱 {self.P.s("image_topic")}')
 
     # ------------------------------------------------------------------ #
@@ -224,20 +243,67 @@ class Arm1VisionNode(Node):
         deadline = time.monotonic() + c.service_timeout_s
         if req.target_rank < 0:
             return self._fail(resp, f'target_rank 不可為負（{req.target_rank}）；0 = 預設取 rank 最小者')
-
         det, why = self.detections.wait_fresh(c.image_timeout_s, c.service_timeout_s)
         if det is None:
             return self._fail(resp, f'沒有可用的影像結果: {why}')
+        t, err = self._find_target(det, int(req.target_rank), deadline)
+        if t is None:
+            return self._fail(resp, err)
+
+        if not req.peek_only:   # 確認要取：通知環境相機標記為「已取走」
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                return self._fail(resp, '逾時：來不及標記已取走')
+            rq = GetRank.Request()
+            rq.x_mm, rq.y_mm, rq.peek_only = t.plane_x, t.plane_y, False
+            r, err = call_service(self.cli_rank, rq, min(c.env_call_timeout_s, remain))
+            if r is None:
+                return self._fail(resp, f'標記已取走失敗: {err}')
+            if not r.success or r.rank != t.rank:
+                return self._fail(resp, f'標記已取走失敗: {r.message}')
+
+        resp.success = True
+        resp.rank, resp.x, resp.y, resp.z = t.rank, t.x, t.y, t.z
+        resp.message = t.message + ('（peek_only，未標記）' if req.peek_only else '')
+        return resp
+
+    def _on_publish(self) -> None:
+        """以處理頻率發布 rank 最小的目標（只查詢，不標記已取走）。失敗時照樣發布 success=false 與原因。"""
+        try:
+            msg = PickTarget()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'arm1_base'
+            det, why = self.detections.wait_fresh(self.cfg.image_timeout_s, 0.0)
+            if det is None:
+                msg.success, msg.message = False, f'沒有可用的影像結果: {why}'
+            else:
+                t, err = self._find_target(det, 0, time.monotonic() + self.cfg.service_timeout_s)
+                if t is None:
+                    msg.success, msg.message = False, err
+                else:
+                    msg.success, msg.message = True, t.message
+                    msg.rank, msg.x, msg.y, msg.z = t.rank, t.x, t.y, t.z
+                    msg.visible_ranks = list(t.visible)
+            self.pub_target.publish(msg)
+        except Exception:
+            self.get_logger().error('pick_target 發布例外:\n' + traceback.format_exc(), throttle_duration_sec=5.0)
+
+    def _find_target(self, det: Detection, target_rank: int, deadline: float) -> Tuple[Optional[Target], str]:
+        """向環境相機查出畫面中各物件的 rank，挑出目標並換算成基座座標（不標記已取走）。
+
+        target_rank=0 取 rank 最小者。回傳 (目標, '') 或 (None, 失敗原因)。
+        """
+        c = self.cfg
         ha, hp = self.h_arm.value, self.h_plane.value
         if ha is None or not ha['valid']:
-            return self._fail(resp, 'arm1_homography 尚未標定（valid=false 或讀取失敗）；'
-                                    '請執行 ros2 run vision_pkg calibrate_homography --target arm1')
+            return None, ('arm1_homography 尚未標定（valid=false 或讀取失敗）；'
+                          '請執行 ros2 run vision_pkg calibrate_homography --target arm1')
         if hp is None or not hp['valid']:
-            return self._fail(resp, 'a_station_homography 尚未標定（valid=false 或讀取失敗）；'
-                                    '請執行 ros2 run vision_pkg calibrate_homography --target a_station')
+            return None, ('a_station_homography 尚未標定（valid=false 或讀取失敗）；'
+                          '請執行 ros2 run vision_pkg calibrate_homography --target a_station')
         if not det.squares:
             extra = f'；另有 {len(det.rejected)} 個橘色區塊被排除（{describe_rejected(det.rejected)}）' if det.rejected else ''
-            return self._fail(resp, f'A 區沒有偵測到橘色正方形{extra}')
+            return None, f'A 區沒有偵測到橘色正方形{extra}'
 
         px = np.array([[s.cx, s.cy] for s in det.squares], dtype=np.float64)
         plane = apply_homography(hp['H'], px)     # A 站平面座標 mm
@@ -249,57 +315,41 @@ class Arm1VisionNode(Node):
         for i in range(len(det.squares)):
             remain = deadline - time.monotonic()
             if remain <= 0:
-                return self._fail(resp, f'逾時：{c.service_timeout_s:.1f}s 內只查到 {i}/{len(det.squares)} 個物件的 rank')
+                return None, f'逾時：{c.service_timeout_s:.1f}s 內只查到 {i}/{len(det.squares)} 個物件的 rank'
             rq = GetRank.Request()
             rq.x_mm, rq.y_mm, rq.peek_only = float(plane[i][0]), float(plane[i][1]), True
             r, err = call_service(self.cli_rank, rq, min(c.env_call_timeout_s, remain))
             if r is None:
-                return self._fail(resp, f'無法向環境相機查詢 rank: {err}')
+                return None, f'無法向環境相機查詢 rank: {err}'
             if not r.success:
                 unmatched.append(f'#{i + 1}@({plane[i][0]:.0f},{plane[i][1]:.0f})mm: {r.message}')
                 continue
             if r.rank not in by_rank or r.distance_mm < by_rank[r.rank][1]:
                 by_rank[r.rank] = (i, r.distance_mm)
 
-        self._overlay = (time.monotonic(),
-                         [(float(px[i][0]), float(px[i][1]), rk) for rk, (i, _) in by_rank.items()], None)
+        ranks_px = [(float(px[i][0]), float(px[i][1]), rk) for rk, (i, _) in by_rank.items()]
+        self._overlay = (time.monotonic(), ranks_px, None)
         if not by_rank:
-            return self._fail(resp, f'{len(det.squares)} 個物件全部配對失敗: ' + '；'.join(unmatched[:2]))
-        if req.target_rank > 0:
-            if req.target_rank not in by_rank:
-                return self._fail(resp, f'指定的 rank {req.target_rank} 不在可見物件中（可見 rank: {sorted(by_rank)}）')
-            rank = int(req.target_rank)
+            return None, f'{len(det.squares)} 個物件全部配對失敗: ' + '；'.join(unmatched[:2])
+        if target_rank > 0:
+            if target_rank not in by_rank:
+                return None, f'指定的 rank {target_rank} 不在可見物件中（可見 rank: {sorted(by_rank)}）'
+            rank = target_rank
         else:
             if unmatched:   # 有看得到卻配不到的物件，無法確定誰才是最小 -> 不猜測
-                return self._fail(resp, f'有 {len(unmatched)} 個物件無法配對 rank，無法確定最小者: ' + '；'.join(unmatched[:2]))
+                return None, f'有 {len(unmatched)} 個物件無法配對 rank，無法確定最小者: ' + '；'.join(unmatched[:2])
             rank = min(by_rank)
 
         i = by_rank[rank][0]
         x, y = float(base[i][0]), float(base[i][1])
         radius = math.hypot(x, y)
         if not (c.reach_min <= radius <= c.reach_max):
-            return self._fail(resp, f'rank {rank} 目標 ({x:.3f}, {y:.3f}) m 半徑 {radius:.3f} m '
-                                    f'超出可達範圍 [{c.reach_min:.2f}, {c.reach_max:.2f}] m')
-
-        if not req.peek_only:   # 確認要取：通知環境相機標記為「已取走」
-            remain = deadline - time.monotonic()
-            if remain <= 0:
-                return self._fail(resp, '逾時：來不及標記已取走')
-            rq = GetRank.Request()
-            rq.x_mm, rq.y_mm, rq.peek_only = float(plane[i][0]), float(plane[i][1]), False
-            r, err = call_service(self.cli_rank, rq, min(c.env_call_timeout_s, remain))
-            if r is None:
-                return self._fail(resp, f'標記已取走失敗: {err}')
-            if not r.success or r.rank != rank:
-                return self._fail(resp, f'標記已取走失敗: {r.message}')
-
-        self._overlay = (time.monotonic(), self._overlay[1], rank)
-        resp.success = True
-        resp.rank, resp.x, resp.y = rank, x, y
-        resp.z = (c.station_height_mm + c.object_height_mm) / 1000.0
-        resp.message = (f'rank {rank} -> base({x:.4f}, {y:.4f}, {resp.z:.4f}) m，半徑 {radius:.3f} m；'
-                        f'可見 rank {sorted(by_rank)}' + ('（peek_only，未標記）' if req.peek_only else ''))
-        return resp
+            return None, (f'rank {rank} 目標 ({x:.3f}, {y:.3f}) m 半徑 {radius:.3f} m '
+                          f'超出可達範圍 [{c.reach_min:.2f}, {c.reach_max:.2f}] m')
+        z = (c.station_height_mm + c.object_height_mm) / 1000.0
+        self._overlay = (time.monotonic(), ranks_px, rank)
+        msg = f'rank {rank} -> base({x:.4f}, {y:.4f}, {z:.4f}) m，半徑 {radius:.3f} m；可見 rank {sorted(by_rank)}'
+        return Target(int(rank), x, y, z, float(plane[i][0]), float(plane[i][1]), sorted(by_rank), msg), ''
 
     # ------------------------------------------------------------------ #
     def get_debug_image(self) -> Optional[np.ndarray]:
@@ -335,7 +385,7 @@ def main(args=None):
     code = 0
     try:
         node = Arm1VisionNode()
-        executor = MultiThreadedExecutor(num_threads=6)   # 4 個 callback group + 餘裕，避免 service 等 client 回應時缺執行緒
+        executor = MultiThreadedExecutor(num_threads=7)   # 5 個 callback group + 餘裕，避免 service 等 client 回應時缺執行緒
         executor.add_node(node)
         spin_node(rclpy, node, executor, node.show_debug, 'arm1_vision')
     except (KeyError, ValueError) as e:

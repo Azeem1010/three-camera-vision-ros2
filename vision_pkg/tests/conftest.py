@@ -36,6 +36,13 @@ def hsv(tmp_path_factory):
 
 @pytest.fixture(scope='session')
 def env_flat():
+    """env_vision.yaml + 舊合成場景用的 color 模式覆寫（三塊彩色站台）。"""
+    return {**load_ros_params_yaml(CONFIG / 'env_vision.yaml'), **S.LEGACY_ENV_PARAMS}
+
+
+@pytest.fixture(scope='session')
+def field_flat():
+    """env_vision.yaml 原樣（field 模式：黑色外框場地）。"""
     return load_ros_params_yaml(CONFIG / 'env_vision.yaml')
 
 

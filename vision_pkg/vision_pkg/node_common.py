@@ -88,11 +88,12 @@ class FrameBuffer:
     def wait_fresh(self, n: int, timeout_s: float) -> List[np.ndarray]:
         """等待「呼叫之後」到達的 n 張新影格；逾時回傳目前已收到的（可能不足 n 張）。"""
         n = min(int(n), self.maxlen)
-        t0 = time.monotonic()
-        deadline = t0 + float(timeout_s)
+        deadline = time.monotonic() + float(timeout_s)
         with self._cv:
+            # 用序號而不是時間判斷「新」：Windows 的 monotonic 解析度約 15 ms，呼叫前剛到的影格時間可能與呼叫時相同
+            seq0 = self._seq
             while True:
-                fresh = [f for (_, t, f) in self._dq if t >= t0]
+                fresh = [f for (s, _, f) in self._dq if s > seq0]
                 if len(fresh) >= n:
                     return fresh[-n:]
                 remain = deadline - time.monotonic()

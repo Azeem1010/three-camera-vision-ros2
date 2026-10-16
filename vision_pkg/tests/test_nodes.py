@@ -83,8 +83,10 @@ class Rig:
             t.join(timeout=2.0)
 
 
-def make_node(cls, name, yaml_name, tmp_path, **over):
+def make_node(cls, name, yaml_name, tmp_path, legacy=True, **over):
     flat = load_ros_params_yaml(CONFIG / yaml_name)
+    if yaml_name == 'env_vision.yaml' and legacy:
+        flat.update(S.LEGACY_ENV_PARAMS)   # 舊合成場景是三塊彩色站台；legacy=False 用 YAML 原樣（field 模式）
     flat.update({'show_debug': False, 'calib_dir': str(tmp_path), 'service_timeout_s': 1.0,
                  'image_timeout_s': 0.5})
     flat.update(over)
@@ -283,6 +285,33 @@ def test_env_missing_parameter_is_reported_with_its_name(tmp_path):
         assert 'match_threshold_mm' in str(e)
 
 
+def test_env_field_mode_end_to_end(tmp_path):
+    """field 模式（YAML 預設）：黑色外框場地 -> 三區定位、占用/手臂判斷、A 區排序與座標配對。"""
+    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path, legacy=False)
+    assert node.cfg.zone_size['a'] == (200.0, 300.0)
+    rig = Rig(node, S.make_field_scene()).start()
+    try:
+        assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
+        assert all(z.source == 'detected' for z in node._zones.values())
+        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 6)
+        r = call(node, '/vision/env/get_zone_state')
+        assert r.success and (r.a_has_object, r.b_has_object, r.c_object_count) == (False, False, 0), r.message
+
+        rig.set_scene(S.make_field_scene(a_objs=S.a_objects()))
+        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').a_has_object, 4)
+        r = call(node, '/vision/env/capture_ranking')
+        assert r.success and r.count == 8, r.message
+        x, y = S.A_POSITIONS[S.A_PERM[2]]            # 第 3 小的物件；A 區平面座標要加上位移
+        ox, oy = S.FIELD_A_OFFSET_MM
+        g = call(node, '/vision/env/get_rank', x_mm=float(x + ox), y_mm=float(y + oy), peek_only=True)
+        assert g.success and g.rank == 3 and g.distance_mm < 5.0, g.message
+
+        rig.set_scene(S.make_field_scene(b_arm=True))
+        assert wait_until(lambda: not call(node, '/vision/env/get_zone_state').b_arm_clear, 3)
+    finally:
+        rig.stop()
+
+
 # --------------------------------------------------------------------------- #
 # 手眼相機 1 節點（與環境相機節點串接）
 # --------------------------------------------------------------------------- #
@@ -394,6 +423,39 @@ def test_arm1_reports_reach_homography_and_env_failures(tmp_path, env_scenes):
         arm1_rig.stop(); env_rig.stop()
 
 
+def _publish(node, topic):
+    """手動觸發節點的發布計時器（Rig 只跑處理計時器 timers[0]），回傳剛發布的訊息。"""
+    node.timers[1][1]()
+    return node.publishers[topic].msgs[-1]
+
+
+def test_arm1_topic_publishes_smallest_rank_without_marking_taken(tmp_path, env_scenes):
+    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
+    try:
+        assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').success)
+        m = _publish(arm1, '/vision/arm1/pick_target')
+        x, y = S.A_POSITIONS[S.A_PERM[0]]
+        assert m.rank == 1 and m.header.frame_id == 'arm1_base'
+        assert abs(m.x - (0.10 + x / 1000.0)) < 0.004 and abs(m.y - (0.05 + y / 1000.0)) < 0.004
+        assert abs(m.z - 0.03) < 1e-9 and list(m.visible_ranks) == list(range(1, 9))
+        assert _publish(arm1, '/vision/arm1/pick_target').rank == 1   # 一直發布也不會把 rank 1 標記成已取走
+
+        assert _pick(arm1).rank == 1                                  # service 照舊：取走 rank 1 並標記
+        m = _publish(arm1, '/vision/arm1/pick_target')                # rank 1 還在畫面上但已標記 -> 不猜測
+        assert not m.success and '無法確定最小者' in m.message
+
+        arm1_rig.set_scene(S.make_env_scene(a_objs=S.a_objects(skip=[0])))   # rank 1 被實際拿走
+        assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').rank == 2, 4)
+    finally:
+        arm1_rig.stop(); env_rig.stop()
+
+
+def test_arm1_topic_reports_failure_when_no_images(tmp_path):
+    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path)
+    m = _publish(arm1, '/vision/arm1/pick_target')
+    assert not m.success and m.message and m.rank == 0
+
+
 def test_arm1_without_homography_or_images_fails_gracefully(tmp_path, env_scenes):
     arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
                      **{'service_timeout_s': 0.3})
@@ -439,6 +501,23 @@ def test_arm2_grid_state_gives_occupancy_and_place_coordinates(tmp_path):
 
         rig.set_scene(S.make_arm2_scene(ASC))
         assert wait_until(lambda: call(node, '/vision/arm2/get_grid_state').all_full, 4)
+    finally:
+        rig.stop()
+
+
+def test_arm2_topic_matches_grid_state_service(tmp_path):
+    node = _arm2_node(tmp_path)
+    m = _publish(node, '/vision/arm2/grid_state')                 # 還沒有影像：照樣發布失敗與原因
+    assert not m.success and m.message and list(m.occupied) == [False] * 8
+    rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
+    try:
+        assert wait_until(lambda: _publish(node, '/vision/arm2/grid_state').success)
+        m = _publish(node, '/vision/arm2/grid_state')
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert m.header.frame_id == 'arm2_base'
+        assert list(m.occupied) == list(r.occupied) == [True, False, True, True, False, True, True, True]
+        assert all(abs(a - b) < 1e-6 for a, b in zip(m.place_x, r.place_x))
+        assert abs(m.place_x[0] - 0.225) < 0.004 and not m.all_full
     finally:
         rig.stop()
 
