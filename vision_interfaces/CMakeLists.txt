@@ -5,9 +5,12 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 
-# service：協調器主動查詢；msg：手眼相機以處理頻率持續發布的 topic（內容同對應 service）
+# 自訂 service（協調器的請求/回應）與 msg（三個節點持續發布的狀態 topic）
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/ZoneState.msg"
   "msg/PickTarget.msg"
+  "msg/RankingSnapshot.msg"
+  "msg/PickDetections.msg"
   "msg/GridState.msg"
   "srv/RecalibrateZones.srv"
   "srv/GetZoneState.srv"

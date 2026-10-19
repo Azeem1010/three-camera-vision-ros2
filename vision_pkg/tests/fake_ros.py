@@ -1,9 +1,10 @@
-"""最小化的假 ROS 2 介面（rclpy / sensor_msgs / std_srvs / vision_interfaces），讓三個節點能在沒有 ROS 的
+"""最小化的假 ROS 2 介面（rclpy / sensor_msgs / std_msgs / std_srvs / vision_interfaces），讓三個節點能在沒有 ROS 的
 機器上跑端到端測試。
 
 重點：模擬 rclpy 訊息欄位的「嚴格型別檢查」（float 欄位不能塞 int、bool 不能塞 numpy.bool_、
 定長陣列長度必須吻合…），這類錯誤在真實 ROS 才會丟 AssertionError，這裡先抓出來。
 它不模擬 executor/QoS；計時器與訂閱回呼由測試自己呼叫（見 test_nodes.py 的 Rig）。
+publisher 只把發布過的訊息存在 FakePublisher.msgs（發布時深拷貝，之後改原物件不影響紀錄）。
 
 用法：  import fake_ros; fake_ros.install()   # 必須在 import 節點模組之前
 """
@@ -27,6 +28,14 @@ def _check(t: str, v, name: str) -> None:
               'int': lambda x: isinstance(x, int) and not isinstance(x, bool),
               'float': lambda x: isinstance(x, float),
               'str': lambda x: isinstance(x, str)}
+    if t == 'Header':
+        if not isinstance(v, Header):
+            bad()
+        return
+    if t == 'Time':
+        if not isinstance(v, Time):
+            bad()
+        return
     if t in scalar:
         if not scalar[t](v):
             bad()
@@ -90,32 +99,30 @@ SRV = {
 }
 Trigger = _srv('Trigger', {}, dict(_OK))
 
+Time = _cls('Time', {'sec': ('int', 0), 'nanosec': ('int', 0)})
+Header = _cls('Header', {'stamp': ('Time', Time()), 'frame_id': ('str', '')})
 
-class Header:
-    def __init__(self):
-        self.stamp, self.frame_id = None, ''
-
-
-def _with_header(name, fields):
-    """含 std_msgs/Header 的訊息：header 不做型別檢查，其餘欄位照常嚴格檢查。"""
-    cls = _cls(name, fields)
-    init = cls.__init__
-
-    def __init__(self, **kw):
-        init(self, **kw)
-        object.__setattr__(self, 'header', Header())
-    cls.__init__ = __init__
-    return cls
-
-
+_HDR = {'header': ('Header', Header()), 'valid': ('bool', False), 'message': ('str', '')}
 MSG = {
-    'PickTarget': _with_header('PickTarget', {
-        'rank': ('int', 0), 'x': ('float', 0.0), 'y': ('float', 0.0), 'z': ('float', 0.0),
-        'visible_ranks': ('int[]', []), **_OK}),
-    'GridState': _with_header('GridState', {
-        'occupied': ('bool[8]', [False] * 8), 'place_x': ('float[8]', [0.0] * 8),
-        'place_y': ('float[8]', [0.0] * 8), 'place_z': ('float[8]', [0.0] * 8),
-        'all_full': ('bool', False), **_OK}),
+    'ZoneState': _cls('ZoneState', {
+        **_HDR, 'a_has_object': ('bool', False), 'b_has_object': ('bool', False), 'b_arm_clear': ('bool', False),
+        'c_object_count': ('int', 0)}),
+    'RankingSnapshot': _cls('RankingSnapshot', {
+        **_HDR, 'low_confidence': ('bool', False), 'rank': ('int[]', []), 'x_mm': ('float[]', []),
+        'y_mm': ('float[]', []), 'side_mm': ('float[]', []), 'taken': ('bool[]', [])}),
+    'PickDetections': _cls('PickDetections', {
+        **_HDR, 'count': ('int', 0), 'pixel_x': ('float[]', []), 'pixel_y': ('float[]', []),
+        'side_px': ('float[]', []), 'plane_valid': ('bool', False), 'plane_x_mm': ('float[]', []),
+        'plane_y_mm': ('float[]', []), 'base_valid': ('bool', False), 'base_x': ('float[]', []),
+        'base_y': ('float[]', []), 'base_z': ('float', 0.0)}),
+    'GridState': _cls('GridState', {
+        **_HDR, 'occupied': ('bool[8]', [False] * 8), 'fill_ratio': ('float[8]', [0.0] * 8),
+        'side_mm': ('float[8]', [0.0] * 8), 'all_full': ('bool', False), 'place_valid': ('bool', False),
+        'place_x': ('float[8]', [0.0] * 8), 'place_y': ('float[8]', [0.0] * 8),
+        'place_z': ('float[8]', [0.0] * 8), 'order_checked': ('bool', False), 'order_ok': ('bool', False),
+        'wrong_slots': ('int[]', []), 'unmeasurable_slots': ('int[]', []), 'approx_slots': ('int[]', [])}),    'PickTarget': _cls('PickTarget', {
+        'header': ('Header', Header()), 'rank': ('int', 0), 'x': ('float', 0.0), 'y': ('float', 0.0),
+        'z': ('float', 0.0), 'visible_ranks': ('int[]', []), **_OK}),
 }
 
 
@@ -203,10 +210,25 @@ class FakeClient:
 
 
 class FakePublisher:
-    def __init__(self, topic):
-        self.topic, self.msgs = topic, []
+    def __init__(self, msg_type, topic, qos):
+        self.msg_type, self.topic, self.qos = msg_type, topic, qos
+        self._lock = threading.Lock()
+        self.msgs = []
 
-    def publish(self, msg): self.msgs.append(msg)
+    def publish(self, msg):
+        if not isinstance(msg, self.msg_type):
+            raise TypeError(f'{self.topic} 只能發布 {self.msg_type.__name__}（收到 {type(msg).__name__}）')
+        with self._lock:
+            self.msgs.append(copy.deepcopy(msg))
+
+    def last(self):
+        with self._lock:
+            return self.msgs[-1] if self.msgs else None
+
+
+class _FakeClock:
+    def now(self):
+        return SimpleNamespace(to_msg=lambda: Time(sec=0, nanosec=0))
 
 
 class FakeNode:
@@ -216,9 +238,11 @@ class FakeNode:
         self.node_name = node_name
         self._params = dict(FakeNode.overrides.get(node_name, {}))
         self._logger = FakeLogger()
-        self.subs, self.timers, self.services, self.clients, self.publishers = [], [], {}, {}, {}
+        self.subs, self.timers, self.services, self.clients, self.pubs = [], [], {}, {}, {}
+        self.publishers = self.pubs   # 舊測試用的名稱
 
     def get_logger(self): return self._logger
+    def get_clock(self): return _FakeClock()
     def list_parameters(self, prefixes, depth): return SimpleNamespace(names=list(self._params))
     def get_parameters(self, names): return [SimpleNamespace(name=n, value=self._params[n]) for n in names]
     def set_param(self, name, value): self._params[name] = value   # 模擬 ros2 param set
@@ -235,13 +259,11 @@ class FakeNode:
         self.services[name] = cb
         return object()
 
-    def create_publisher(self, msg_type, topic, qos):
-        p = FakePublisher(topic)
-        self.publishers[topic] = p
+    def create_publisher(self, msg_type, topic, qos, callback_group=None):
+        assert topic not in self.pubs, f'重複建立 publisher {topic}'
+        p = FakePublisher(msg_type, topic, qos)
+        self.pubs[topic] = p
         return p
-
-    def get_clock(self):
-        return SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: 'stamp'))
 
     def create_client(self, srv_type, name, callback_group=None):
         c = FakeClient(srv_type, name, callback_group)
@@ -267,12 +289,16 @@ def install() -> None:
     mod('rclpy.executors', MultiThreadedExecutor=type('MultiThreadedExecutor', (), {
         '__init__': lambda self, num_threads=1: None, 'add_node': lambda self, n: None,
         'spin': lambda self: None, 'shutdown': lambda self: None}))
-    mod('rclpy.qos', qos_profile_sensor_data=object())
+    mod('rclpy.qos', qos_profile_sensor_data=object(),
+        QoSProfile=lambda **kw: SimpleNamespace(**kw),
+        DurabilityPolicy=SimpleNamespace(TRANSIENT_LOCAL='transient_local', VOLATILE='volatile'))
     mod('rclpy.utilities', remove_ros_args=lambda args=None: list(args or []))
     mod('sensor_msgs', msg=None)
     mod('sensor_msgs.msg', Image=Image)
     mod('std_srvs', srv=None)
     mod('std_srvs.srv', Trigger=Trigger)
+    mod('std_msgs', msg=None)
+    mod('std_msgs.msg', Header=Header)
     mod('vision_interfaces', srv=None, msg=None)
     mod('vision_interfaces.srv', **SRV)
     mod('vision_interfaces.msg', **MSG)

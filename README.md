@@ -1,13 +1,16 @@
 # 雙機械手臂協同搬運系統 — 視覺（三顆鏡頭 / OpenCV / ROS 2 Jazzy）
 
 只負責視覺：環境相機、手眼相機 1（Home_A）、手眼相機 2（Home_C）。任務協調器與手臂控制由其他組員負責，
-彼此主要透過 **ROS service** 溝通；手眼相機另外以 10 Hz 發布 topic（`/vision/arm1/pick_target`、`/vision/arm2/grid_state`，
-內容同對應 service，見第 3 節）。不使用深度學習，OpenCV 用 apt 版（4.6 API）。
+彼此以 **ROS service** 溝通（請求/回應）；三個節點另外把同一份結果以 **topic** 持續發布，
+供監看、記錄或想用訂閱方式的組員使用（見第 2.1 節）。不使用深度學習，OpenCV 用 apt 版（4.6 API）。
 
 ```
- usb_cam /env_cam ──► env_vision_node  ──► /vision/env/{recalibrate_zones,get_zone_state,capture_ranking,get_rank,clear_taken}
- usb_cam /arm1_cam ─► arm1_vision_node ──► /vision/arm1/get_pick_target ──(client)──► /vision/env/get_rank
- usb_cam /arm2_cam ─► arm2_vision_node ──► /vision/arm2/{get_grid_state,verify_place}
+ usb_cam /env_cam ──► env_vision_node  ──► srv   /vision/env/{recalibrate_zones,get_zone_state,capture_ranking,get_rank,clear_taken}
+                                       └─► topic /vision/env/{zone_state,ranking}
+ usb_cam /arm1_cam ─► arm1_vision_node ──► srv   /vision/arm1/get_pick_target ──(client)──► /vision/env/get_rank
+                                       └─► topic /vision/arm1/{pick_target,detections}
+ usb_cam /arm2_cam ─► arm2_vision_node ──► srv   /vision/arm2/{get_grid_state,verify_place}
+                                       └─► topic /vision/arm2/grid_state
 ```
 
 三個節點是三個獨立行程（一顆鏡頭出錯不影響其他節點）；影像演算法全部在 `vision_core/`，不含 ROS，可用靜態圖片單獨測試。
@@ -19,10 +22,11 @@
 ```
 三鏡頭Opencv/
 ├── README.md
-├── vision_interfaces/                  # ament_cmake：所有自訂 srv
+├── vision_interfaces/                  # ament_cmake：所有自訂 srv / msg
 │   ├── CMakeLists.txt  package.xml
-│   └── srv/ RecalibrateZones  GetZoneState  CaptureRanking  GetRank
-│            GetPickTarget  GetGridState  VerifyPlace   (.srv)
+│   ├── srv/ RecalibrateZones  GetZoneState  CaptureRanking  GetRank
+│   │        GetPickTarget  GetGridState  VerifyPlace   (.srv)
+│   └── msg/ ZoneState  RankingSnapshot  PickDetections  GridState   (.msg，topic 用)
 └── vision_pkg/                         # ament_python
     ├── package.xml  setup.py  setup.cfg  pytest.ini  resource/vision_pkg
     ├── launch/vision.launch.py         # 一次啟動 3 個 usb_cam + 3 個視覺節點（show_debug 啟動參數）
@@ -122,6 +126,30 @@ string message
 homography 未標定、偵測數量不符等情況一律回 `success=false` 與明確的 `message`，節點不會崩潰；
 無法判斷時不猜測（例如快照不是 8 個物件、格內物件黏在一起量不到邊長）。
 
+### 2.1 Topic（`vision_interfaces/msg/`）
+
+service 全部保留、行為不變；topic 是同一份處理結果的廣播，不會觸發任何動作（拍快照、標記已取走仍只能用 service）。
+
+| Topic | 型別 | 發布時機 | 內容 |
+|---|---|---|---|
+| `/vision/env/zone_state` | `ZoneState` | 每處理一張新影格（≈ `process_hz`） | 同 `get_zone_state` |
+| `/vision/env/ranking` | `RankingSnapshot` | 快照成功/失敗/作廢、已取走標記改變時（`transient_local`，晚訂閱也收得到最後一筆） | 各物件 rank、A 站平面座標、邊長、是否已取走 |
+| `/vision/arm1/pick_target` | `PickTarget` | 每個處理週期（獨立計時器） | rank 最小的目標 + 基座 x/y/z、可見 rank（同 `get_pick_target(target_rank=0, peek_only=true)`，**不標記已取走**） |
+| `/vision/arm1/detections` | `PickDetections` | 每處理一張新影格 | 各正方形的像素 / A 站平面 mm / 手臂 1 基座 m 座標（**不含 rank**） |
+| `/vision/arm2/grid_state` | `GridState` | 每處理一張新影格 | 同 `get_grid_state`，再加各格比例、邊長（NaN = 無）與 `verify_place` 的排序檢查 |
+
+共通規則：每則訊息都有 `header`、`valid`、`message`（`pick_target` 用 `success`，與 service 一致）。
+`frame_id`：含基座座標的 `pick_target` / `grid_state` 為 `arm1_base` / `arm2_base`，其餘為相機名稱。`valid=false` 時只看 `message`
+（例如「影像中斷 0.8s」「站台尚未定位」「C 區定位失敗」），其餘欄位無意義；`zone_state` 無效時 `b_arm_clear` 一律 false。
+homography 未標定時座標欄位以 `plane_valid` / `base_valid` / `place_valid` 標示，不影響其他欄位。
+
+手眼相機 1 有兩個 topic：`pick_target` 直接給「下一個要夾的目標」，但每個週期都要向環境相機查每個物件的 rank
+（約 10 Hz × 物件數次 `get_rank` 呼叫）；`detections` 只給座標、不呼叫任何 service，需要 rank 時用
+`plane_x_mm / plane_y_mm` 對照 `/vision/env/ranking`。`pick_target` **不會標記「已取走」**：真正要夾取時，
+仍要呼叫一次 `get_pick_target`（peek_only=false），否則物件還在畫面上時無法區分「已取走」與「還沒取」。
+
+**安全性**：B 區放行等「要動手臂前」的判斷仍建議用 service 拿當下結果；用 topic 時請檢查 `valid` 與 `header.stamp` 是否夠新。
+
 ## 3. 介面速查
 
 ```bash
@@ -133,17 +161,14 @@ ros2 service call /vision/env/clear_taken       std_srvs/srv/Trigger
 ros2 service call /vision/arm1/get_pick_target  vision_interfaces/srv/GetPickTarget "{target_rank: 0, peek_only: true}"
 ros2 service call /vision/arm2/get_grid_state   vision_interfaces/srv/GetGridState
 ros2 service call /vision/arm2/verify_place     vision_interfaces/srv/VerifyPlace "{slot: 3}"
+
+ros2 topic echo /vision/env/zone_state
+ros2 topic echo /vision/env/ranking --qos-durability transient_local
+ros2 topic echo /vision/arm1/pick_target
+ros2 topic echo /vision/arm1/detections
+ros2 topic echo /vision/arm2/grid_state
+ros2 topic hz   /vision/arm2/grid_state
 ```
-
-Topic（以 `process_hz` 持續發布；失敗時照樣發布 `success=false` 與原因，`header.stamp` 可判斷是否還活著）：
-
-```bash
-ros2 topic echo /vision/arm1/pick_target   # vision_interfaces/msg/PickTarget：rank 最小的目標 + 基座 x/y/z（只查詢，不標記已取走）
-ros2 topic echo /vision/arm2/grid_state    # vision_interfaces/msg/GridState：同 get_grid_state
-```
-
-`pick_target` 等同持續呼叫 `get_pick_target(target_rank=0, peek_only=true)`。**它不會標記「已取走」**：真正要夾取時，
-仍要呼叫一次 `get_pick_target`（peek_only=false），否則物件還在畫面上時無法區分「已取走」與「還沒取」。
 
 典型一輪：`capture_ranking`（批次開始，8 個物件都在 A 區）→ 每次取件前 `get_pick_target(target_rank=k)`
 → 手臂 1 搬運（B 區進出前看 `get_zone_state.b_arm_clear`）→ 手臂 2 放入 C 區後 `verify_place(slot=k)`。

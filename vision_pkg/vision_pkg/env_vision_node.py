@@ -14,6 +14,10 @@ Services（皆有逾時處理，失敗時 success=false 並附明確 message）
   /vision/env/get_rank            輸入 A 站平面座標 -> rank（已取走者標記，避免重複配對）
   /vision/env/clear_taken         （額外）清除「已取走」標記，供重試/復原使用
 
+Topics（service 保留不變；topic 是同一份結果的持續廣播）
+  /vision/env/zone_state   vision_interfaces/ZoneState        每處理一張新影格發布一次；影像中斷時 valid=false
+  /vision/env/ranking      vision_interfaces/RankingSnapshot  transient_local，快照或已取走標記改變時發布
+
 執行緒模型：MultiThreadedExecutor；影像訂閱、處理計時器、service 伺服端各放在不同的
 MutuallyExclusiveCallbackGroup，service 等新影像時不會擋住影像接收。
 """
@@ -35,15 +39,17 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
+from vision_interfaces.msg import RankingSnapshot
+from vision_interfaces.msg import ZoneState as ZoneStateMsg
 from vision_interfaces.srv import CaptureRanking, GetRank, GetZoneState, RecalibrateZones
 
 from vision_pkg import calib_io
 from vision_pkg.debug_draw import draw_poly, put_text
-from vision_pkg.node_common import (Debouncer, FlatParams, FrameBuffer, LatestValue,
-                                    image_msg_to_bgr, read_ros_params, spin_node)
+from vision_pkg.node_common import (Debouncer, FlatParams, FrameBuffer, LatestValue, image_msg_to_bgr,
+                                    image_problem, read_ros_params, spin_node, stamp)
 from vision_pkg.vision_core.color_zone import (FieldParams, HsvRange, MaskParams, OccupancyParams, ZoneFindParams,
                                                ZoneRoi, count_blobs, judge_arm_present, judge_object_present,
                                                locate_field_zones, locate_zones, make_roi, measure_zones)
@@ -79,6 +85,7 @@ class ZoneState:
 @dataclass
 class Snapshot:
     objects: List[ObjectInfo]
+    low_confidence: bool = False
     taken: Set[int] = field(default_factory=set)
 
 
@@ -138,6 +145,11 @@ class EnvVisionNode(Node):
         self.create_service(CaptureRanking, '/vision/env/capture_ranking', self._srv_capture, callback_group=g_srv)
         self.create_service(GetRank, '/vision/env/get_rank', self._srv_get_rank, callback_group=g_srv)
         self.create_service(Trigger, '/vision/env/clear_taken', self._srv_clear_taken, callback_group=g_srv)
+        self.pub_state = self.create_publisher(ZoneStateMsg, '/vision/env/zone_state', 10)
+        self.pub_ranking = self.create_publisher(
+            RankingSnapshot, '/vision/env/ranking',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._publish_ranking('尚未拍攝快照')
         self.get_logger().info(f'env_vision_node 就緒，訂閱 {self.P.s("image_topic")}，等待影像與站台定位…')
 
     # ------------------------------------------------------------------ #
@@ -291,7 +303,9 @@ class EnvVisionNode(Node):
                     self.get_logger().error(f'[{source}] {z.upper()} 區偵測失敗且沒有上次存檔: {r.message}')
                     msgs.append(f'{z.upper()} 區失敗且無存檔: {r.message}')
             if any_new:
-                self._snap = None  # 站台平面改了，舊快照作廢
+                if self._snap is not None:
+                    self._snap = None  # 站台平面改了，舊快照作廢
+                    self._publish_ranking('站台已重新定位，舊快照作廢（請重新 capture_ranking）')
                 try:
                     h, w = frames[0].shape[:2]
                     calib_io.save_zones(self.calib_dir, (w, h),
@@ -355,20 +369,23 @@ class EnvVisionNode(Node):
             if not self._boot_done:
                 return
         latest = self.frames.latest()
-        if latest is None:
+        problem = image_problem(latest, now, self.cfg.image_timeout_s)
+        if problem:
+            # 不更新 self.state（讓舊結果自然過期），但 topic 要明確告知訂閱者目前沒有可信結果
+            self._publish_state(ZoneState(False, problem))
             return
         seq, t_arr, frame = latest
-        if seq == self._last_seq or now - t_arr > self.cfg.image_timeout_s:
-            return  # 沒有新影格 / 影像已中斷：不產生新結果，讓舊結果自然過期
+        if seq == self._last_seq:
+            return  # 沒有新影格
         self._last_seq = seq
 
         ranges, why = self._ranges()
         rois = self._ensure_rois(frame.shape)
         if ranges is None:
-            self.state.set(ZoneState(False, why))
+            self._set_state(ZoneState(False, why))
             return
         if rois is None:
-            self.state.set(ZoneState(False, '站台尚未定位（請在桌面淨空時呼叫 /vision/env/recalibrate_zones）'))
+            self._set_state(ZoneState(False, '站台尚未定位（請在桌面淨空時呼叫 /vision/env/recalibrate_zones）'))
             self._render(frame, None, None, None)
             return
 
@@ -397,8 +414,42 @@ class EnvVisionNode(Node):
         c_cnt = int(np.median(list(self._c_counts)))
         detail = f'A[{a_info}] B[{b_info}; {arm_info}] C[n={c_cnt}]'
         st = ZoneState(True, 'ok', bool(a_obj), bool(b_obj), not bool(arm), c_cnt, detail)
-        self.state.set(st)
+        self._set_state(st)
         self._render(frame, st, orange_mask, rois)
+
+    # ------------------------------------------------------------------ #
+    # Topics
+    # ------------------------------------------------------------------ #
+    def _set_state(self, st: ZoneState) -> None:
+        self.state.set(st)
+        self._publish_state(st)
+
+    def _publish_state(self, st: ZoneState) -> None:
+        m = ZoneStateMsg()
+        m.valid = bool(st.valid)
+        m.message = st.detail if st.valid else st.message
+        m.a_has_object, m.b_has_object = bool(st.a_has_object), bool(st.b_has_object)
+        m.b_arm_clear = bool(st.valid and st.b_arm_clear)   # 無效時一律保守回報「手臂還在」
+        m.c_object_count = int(st.c_object_count)
+        self.pub_state.publish(stamp(self, m, CAM_NAME))
+
+    def _publish_ranking(self, reason: str = '') -> None:
+        """發布目前快照（含已取走標記）；沒有快照時 valid=false，message = reason。"""
+        m = RankingSnapshot()
+        with self._lock:
+            snap = self._snap
+            objs = list(snap.objects) if snap else []
+            taken = set(snap.taken) if snap else set()
+            low = bool(snap.low_confidence) if snap else False
+        m.valid = snap is not None
+        m.message = f'{len(objs)} 個物件，已取走 {len(taken)} 個' if snap else (reason or '尚未拍攝快照')
+        m.low_confidence = low
+        m.rank = [int(o.rank) for o in objs]
+        m.x_mm = [float(o.x_mm) for o in objs]
+        m.y_mm = [float(o.y_mm) for o in objs]
+        m.side_mm = [float(o.side_mm) for o in objs]
+        m.taken = [i in taken for i in range(len(objs))]
+        self.pub_ranking.publish(stamp(self, m, CAM_NAME))
 
     # ------------------------------------------------------------------ #
     # Services
@@ -441,8 +492,11 @@ class EnvVisionNode(Node):
         resp.count, resp.low_confidence = 0, False
         try:
             with self._lock:
+                had_snap = self._snap is not None
                 self._snap = None   # 先作廢舊快照：這次若失敗，不能讓後面的 get_rank 配到上一批的資料
                 zone = self._zones.get('a')
+            if had_snap:
+                self._publish_ranking('快照拍攝中（舊快照已作廢）')
             if zone is None:
                 resp.success, resp.message = False, 'A 站台尚未定位（請先呼叫 recalibrate_zones）'
                 return resp
@@ -464,10 +518,12 @@ class EnvVisionNode(Node):
             resp.count, resp.low_confidence = int(res.count), bool(res.low_confidence)
             if res.success:
                 with self._lock:
-                    self._snap = Snapshot(res.objects)
+                    self._snap = Snapshot(res.objects, bool(res.low_confidence))
                 self.get_logger().info(f'快照完成: {res.count} 個物件，low_confidence={res.low_confidence}')
+                self._publish_ranking()
             else:
                 self.get_logger().warning(f'快照失敗: {res.message}')
+                self._publish_ranking(f'快照失敗: {res.message}')
         except Exception as e:
             self.get_logger().error('capture_ranking 例外:\n' + traceback.format_exc())
             resp.success, resp.message = False, f'內部錯誤: {e!r}'
@@ -492,6 +548,7 @@ class EnvVisionNode(Node):
             if m.success and not req.peek_only:
                 with self._lock:
                     snap.taken.add(m.index)
+                self._publish_ranking()
         except Exception as e:
             self.get_logger().error('get_rank 例外:\n' + traceback.format_exc())
             resp.success, resp.message = False, f'內部錯誤: {e!r}'
@@ -502,6 +559,8 @@ class EnvVisionNode(Node):
             n = len(self._snap.taken) if self._snap else 0
             if self._snap:
                 self._snap.taken.clear()
+        if n:
+            self._publish_ranking()
         resp.success, resp.message = True, f'已清除 {n} 個「已取走」標記'
         return resp
 

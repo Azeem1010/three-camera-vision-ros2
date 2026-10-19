@@ -9,8 +9,10 @@
 Services
   /vision/arm2/get_grid_state   occupied[8]、各格放置座標、all_full
   /vision/arm2/verify_place     指定格位是否已放置、已占用格位的邊長是否隨編號遞增、排錯的格位
-Topic
-  /vision/arm2/grid_state       （vision_interfaces/GridState）以 process_hz 持續發布，內容同 get_grid_state
+
+Topic（service 保留不變）
+  /vision/arm2/grid_state       vision_interfaces/GridState：每處理一張新影格發布一次，內容 = get_grid_state
+                                + 各格比例/邊長 + verify_place 的排序檢查；影像中斷或 C 區定位失敗時 valid=false
 
 格位編號：上排（靠近 B 區）1–4，下排 5–8，各排由左至右。校正後影像的「上排」要對應到
 靠近 B 區那一排，由參數 warp_rotation_k（0..3）決定，請看 debug 視窗確認。
@@ -40,7 +42,7 @@ from vision_interfaces.srv import GetGridState, VerifyPlace
 from vision_pkg import calib_io
 from vision_pkg.debug_draw import draw_corner_ids, draw_poly, put_text
 from vision_pkg.node_common import (FlatParams, FrameBuffer, LatestValue, image_msg_to_bgr,
-                                    read_ros_params, spin_node)
+                                    image_problem, read_ros_params, spin_node, stamp)
 from vision_pkg.vision_core.color_zone import (MaskParams, ZoneFindParams, find_zone, hsv_mask,
                                                warp_to_plane)
 from vision_pkg.vision_core.geometry import apply_homography, rotate_corners
@@ -109,7 +111,6 @@ class Arm2VisionNode(Node):
         self.create_service(GetGridState, '/vision/arm2/get_grid_state', self._srv_grid_state, callback_group=g_srv)
         self.create_service(VerifyPlace, '/vision/arm2/verify_place', self._srv_verify, callback_group=g_srv)
         self.pub_grid = self.create_publisher(GridState, '/vision/arm2/grid_state', 10)
-        self.create_timer(1.0 / self.cfg.process_hz, self._on_publish, callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(f'arm2_vision_node 就緒，訂閱 {self.P.s("image_topic")}')
 
     # ------------------------------------------------------------------ #
@@ -189,17 +190,19 @@ class Arm2VisionNode(Node):
         if self.h_arm.poll():
             self.get_logger().info(f'arm2_homography 已重新載入（valid={self.h_arm.value["valid"]}）')
         latest = self.frames.latest()
-        if latest is None:
+        problem = image_problem(latest, now, self.cfg.image_timeout_s)
+        if problem:
+            self._publish(GridResult(False, problem))   # 不更新 self.results，讓舊結果自然過期
             return
         seq, t_arr, frame = latest
-        if seq == self._last_seq or now - t_arr > self.cfg.image_timeout_s:
+        if seq == self._last_seq:
             return
         self._last_seq = seq
 
         c = self.cfg
         hsv = self.hsv.value
         if hsv is None or 'orange' not in hsv or c.zone_key not in hsv:
-            self.results.set(GridResult(False, f'HSV 設定不可用（需要 orange 與 {c.zone_key}）: {self.hsv.error}'))
+            self._set_result(GridResult(False, f'HSV 設定不可用（需要 orange 與 {c.zone_key}）: {self.hsv.error}'))
             return
         # 物件遮罩併入站台遮罩：放滿物件、貼近站台邊緣時才不會把站台外框咬掉一角
         objects = hsv_mask(frame, hsv['orange'], c.orange_mp)
@@ -209,7 +212,7 @@ class Arm2VisionNode(Node):
             self._last_good_t = now
         if not self._corner_hist or now - self._last_good_t > c.corner_hold_s:
             self._corner_hist.clear()
-            self.results.set(GridResult(False, f'C 區定位失敗: {zr.reason or "尚無偵測結果"}'))
+            self._set_result(GridResult(False, f'C 區定位失敗: {zr.reason or "尚無偵測結果"}'))
             self._render(frame, None, None, None, None)
             return
 
@@ -224,8 +227,43 @@ class Arm2VisionNode(Node):
         res = GridResult(True, 'ok', list(ga.occupied), list(ga.ratios),
                          [None if s is None else s / c.ppm for s in ga.sides_px],
                          list(ga.approx_slots), list(ga.unmeasurable_slots), base_xy)
-        self.results.set(res)
+        self._set_result(res)
         self._render(frame, rot, warped, ga, res)
+
+    # ------------------------------------------------------------------ #
+    def _set_result(self, res: GridResult) -> None:
+        self.results.set(res)
+        self._publish(res)
+
+    def _publish(self, res: GridResult) -> None:
+        m = GridState()
+        m.valid, m.message = bool(res.valid), res.message
+        if res.valid:
+            m.occupied = [bool(o) for o in res.occupied]
+            m.fill_ratio = [float(r) for r in res.ratios]
+            m.side_mm = [float('nan') if s is None else float(s) for s in res.sides_mm]
+            m.all_full = all(res.occupied)
+            m.unmeasurable_slots = [int(s) for s in res.unmeasurable_slots]
+            m.approx_slots = [int(s) for s in res.approx_slots]
+            notes = ['占用比例: ' + ' '.join(f'{i + 1}:{r:.2f}' for i, r in enumerate(res.ratios))]
+            if res.base_xy is not None:
+                z = (self.cfg.station_height_mm + self.cfg.object_height_mm) / 1000.0
+                m.place_valid = True
+                m.place_x = [float(v) for v in res.base_xy[:, 0]]
+                m.place_y = [float(v) for v in res.base_xy[:, 1]]
+                m.place_z = [z] * N_SLOTS
+            else:
+                notes.append('arm2_homography 未標定，place_* 無效')
+            if res.unmeasurable_slots:
+                notes.append(f'格位 {res.unmeasurable_slots} 已占用但無法量測邊長，未做排序檢查')
+            else:
+                chk = self.ranker.check_order(res.sides_mm)
+                m.order_checked, m.order_ok = True, bool(chk.order_ok)
+                m.wrong_slots = [int(s) for s in chk.wrong_slots]
+                if chk.message:
+                    notes.append(chk.message)
+            m.message = '；'.join(notes)
+        self.pub_grid.publish(stamp(self, m, 'arm2_base'))   # place_* 是手臂 2 基座座標
 
     # ------------------------------------------------------------------ #
     def _get_result(self, resp):
@@ -240,7 +278,7 @@ class Arm2VisionNode(Node):
         return res
 
     def _fill_grid(self, out, res: GridResult) -> None:
-        """把有效結果填進 GetGridState 回應或 GridState 訊息（兩者欄位名稱相同）。"""
+        """把有效結果填進 GetGridState 回應。"""
         out.occupied = [bool(o) for o in res.occupied]
         out.all_full = all(res.occupied)
         if res.base_xy is None:
@@ -273,24 +311,6 @@ class Arm2VisionNode(Node):
             self.get_logger().error('get_grid_state 例外:\n' + traceback.format_exc())
             resp.success, resp.message = False, f'內部錯誤: {e!r}'
         return resp
-
-    def _on_publish(self) -> None:
-        """以處理頻率發布最新格位狀態；影像中斷/定位失敗時照樣發布 success=false 與原因。"""
-        try:
-            msg = GridState()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'arm2_base'
-            self._grid_defaults(msg)
-            res, why = self.results.wait_fresh(self.cfg.image_timeout_s, 0.0)
-            if res is None:
-                msg.success, msg.message = False, why
-            elif not res.valid:
-                msg.success, msg.message = False, res.message
-            else:
-                self._fill_grid(msg, res)
-            self.pub_grid.publish(msg)
-        except Exception:
-            self.get_logger().error('grid_state 發布例外:\n' + traceback.format_exc(), throttle_duration_sec=5.0)
 
     def _srv_verify(self, req, resp):
         resp.placed, resp.order_ok, resp.wrong_slots = False, False, []
@@ -363,7 +383,7 @@ def main(args=None):
     code = 0
     try:
         node = Arm2VisionNode()
-        executor = MultiThreadedExecutor(num_threads=5)   # 影像 / 處理 / service / 發布 各一組 + 餘裕
+        executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)
         spin_node(rclpy, node, executor, node.show_debug, 'arm2_vision')
     except (KeyError, ValueError) as e:

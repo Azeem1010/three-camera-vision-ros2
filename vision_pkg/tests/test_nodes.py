@@ -507,12 +507,14 @@ def test_arm2_grid_state_gives_occupancy_and_place_coordinates(tmp_path):
 
 def test_arm2_topic_matches_grid_state_service(tmp_path):
     node = _arm2_node(tmp_path)
-    m = _publish(node, '/vision/arm2/grid_state')                 # 還沒有影像：照樣發布失敗與原因
-    assert not m.success and m.message and list(m.occupied) == [False] * 8
+    pub = node.pubs['/vision/arm2/grid_state']
+    node._on_tick()                                               # 還沒有影像：照樣發布失敗與原因
+    m = pub.last()
+    assert not m.valid and '尚未收到影像' in m.message and list(m.occupied) == [False] * 8
     rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
     try:
-        assert wait_until(lambda: _publish(node, '/vision/arm2/grid_state').success)
-        m = _publish(node, '/vision/arm2/grid_state')
+        assert wait_until(lambda: pub.last().valid)
+        m = pub.last()
         r = call(node, '/vision/arm2/get_grid_state')
         assert m.header.frame_id == 'arm2_base'
         assert list(m.occupied) == list(r.occupied) == [True, False, True, True, False, True, True, True]
@@ -652,5 +654,147 @@ def test_debug_images_are_produced_when_show_debug_is_true(tmp_path, env_scenes)
         assert wait_until(lambda: arm2.get_debug_image() is not None)
         img = arm2.get_debug_image()
         assert img.shape[1] == 640 and img.shape[0] > 480            # 上：原始影像；下：校正後的格位圖
+    finally:
+        rig.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Topics（service 保留不變；topic 持續廣播同一份結果）
+# --------------------------------------------------------------------------- #
+def test_env_zone_state_topic_matches_service_and_reports_image_loss(tmp_path, env_scenes):
+    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+    pub = node.pubs['/vision/env/zone_state']
+    rig = Rig(node, env_scenes['empty']).start()
+    try:
+        assert wait_until(lambda: pub.last() is not None and pub.last().valid and pub.last().b_arm_clear, 6)
+        rig.set_scene(S.make_env_scene(a_objs=S.a_objects(), c_objs=[(40, 40, 30, 0), (150, 60, 30, 20)]))
+        assert wait_until(lambda: pub.last().a_has_object and pub.last().c_object_count == 2, 4)
+        m = pub.last()
+        assert m.header.frame_id == 'env_cam' and not m.b_has_object
+        r = call(node, '/vision/env/get_zone_state')
+        assert (r.a_has_object, r.b_has_object, r.b_arm_clear, r.c_object_count) == \
+               (m.a_has_object, m.b_has_object, m.b_arm_clear, m.c_object_count)
+
+        rig.paused = True                                   # 影像中斷：topic 改發 valid=false，且保守回報手臂在場
+        assert wait_until(lambda: not pub.last().valid, 3)
+        m = pub.last()
+        assert '影像中斷' in m.message and not m.b_arm_clear
+    finally:
+        rig.stop()
+
+
+def test_env_ranking_topic_follows_snapshot_and_taken_marks(tmp_path, env_scenes):
+    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+    pub = node.pubs['/vision/env/ranking']
+    assert pub.qos.durability == 'transient_local'            # 晚訂閱者也能拿到最後一筆
+    first = pub.last()
+    assert first is not None and not first.valid and '尚未拍攝快照' in first.message
+    rig = Rig(node, env_scenes['empty']).start()
+    try:
+        assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
+        rig.set_scene(env_scenes['a8'])
+        assert call(node, '/vision/env/capture_ranking').success
+        m = pub.last()
+        assert m.valid and m.rank == list(range(1, 9)) and m.taken == [False] * 8
+        assert len(m.x_mm) == len(m.y_mm) == len(m.side_mm) == 8
+        assert m.side_mm == sorted(m.side_mm)
+
+        x, y = S.A_POSITIONS[S.A_PERM[2]]
+        n = len(pub.msgs)
+        call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y), peek_only=True)
+        assert len(pub.msgs) == n                            # peek 不改狀態，不發布
+        assert call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y)).success
+        assert pub.last().taken == [False, False, True] + [False] * 5
+        call(node, '/vision/env/clear_taken')
+        assert pub.last().taken == [False] * 8
+
+        rig.set_scene(env_scenes['a7'])                       # 拍攝失敗：topic 也宣告快照無效
+        assert not call(node, '/vision/env/capture_ranking').success
+        m = pub.last()
+        assert not m.valid and '快照失敗' in m.message and m.rank == []
+    finally:
+        rig.stop()
+
+
+def test_arm1_detections_topic_gives_plane_and_base_coordinates(tmp_path, env_scenes):
+    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
+    pub = arm1.pubs['/vision/arm1/detections']
+    try:
+        assert wait_until(lambda: pub.last() is not None and pub.last().valid and pub.last().count == 8)
+        m = pub.last()
+        assert m.header.frame_id == 'arm1_cam'
+        assert m.plane_valid and m.base_valid
+        assert len(m.pixel_x) == len(m.plane_x_mm) == len(m.base_x) == 8
+        assert abs(m.base_z - 0.03) < 1e-9
+        # 每個真實物件位置都要對得到一筆偵測（平面 mm 與基座 m 一致）
+        for (x, y) in S.A_POSITIONS:
+            d = [np.hypot(px - x, py - y) for px, py in zip(m.plane_x_mm, m.plane_y_mm)]
+            i = int(np.argmin(d))
+            assert d[i] < 4.0
+            assert abs(m.base_x[i] - (0.10 + m.plane_x_mm[i] / 1000.0)) < 1e-6
+            assert abs(m.base_y[i] - (0.05 + m.plane_y_mm[i] / 1000.0)) < 1e-6
+        assert call(arm1, '/vision/arm1/get_pick_target', peek_only=True).success   # service 照常可用
+
+        arm1_rig.paused = True
+        assert wait_until(lambda: not pub.last().valid, 3)
+        assert '影像中斷' in pub.last().message
+    finally:
+        arm1_rig.stop()
+        env_rig.stop()
+
+
+def test_arm1_detections_topic_without_homography(tmp_path, env_scenes):
+    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
+                     **{'square.min_area_px': 150.0})
+    pub = arm1.pubs['/vision/arm1/detections']
+    rig = Rig(arm1, env_scenes['a8']).start()
+    try:
+        assert wait_until(lambda: pub.last() is not None and pub.last().valid)
+        m = pub.last()
+        assert m.count > 0 and len(m.pixel_x) == m.count
+        assert not m.plane_valid and not m.base_valid and m.plane_x_mm == [] and m.base_x == []
+        assert '未標定' in m.message
+    finally:
+        rig.stop()
+
+
+def test_arm2_grid_state_topic_includes_order_check(tmp_path):
+    node = _arm2_node(tmp_path)
+    pub = node.pubs['/vision/arm2/grid_state']
+    rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
+    try:
+        assert wait_until(lambda: pub.last() is not None and pub.last().valid)
+        m = pub.last()
+        assert m.header.frame_id == 'arm2_base'
+        assert m.occupied == [True, False, True, True, False, True, True, True] and not m.all_full
+        assert m.place_valid and abs(m.place_x[0] - 0.225) < 0.004 and abs(m.place_y[7] - (-0.025)) < 0.004
+        assert np.isnan(m.side_mm[1]) and abs(m.side_mm[0] - 28) < 2.5
+        assert m.order_checked and m.order_ok and m.wrong_slots == []
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert list(r.occupied) == m.occupied and list(r.place_x) == m.place_x
+
+        rig.set_scene(S.make_arm2_scene([28, 30, 38, 34, 36, 32, 40, 42]))     # 格位 3 與 6 放錯
+        assert wait_until(lambda: pub.last().valid and pub.last().all_full and not pub.last().order_ok, 4)
+        assert pub.last().wrong_slots == [3, 6]
+
+        rig.paused = True
+        assert wait_until(lambda: not pub.last().valid, 3)
+        m = pub.last()
+        assert '影像中斷' in m.message and m.occupied == [False] * 8 and not m.place_valid
+    finally:
+        rig.stop()
+
+
+def test_arm2_grid_state_topic_does_not_guess_order_when_unmeasurable(tmp_path):
+    node = _arm2_node(tmp_path, with_h=False)
+    pub = node.pubs['/vision/arm2/grid_state']
+    rig = Rig(node, S.make_arm2_scene([42, 42, None, None, None, None, None, None],
+                                      extra_objs=[(50, 25, 20, 0)])).start()
+    try:
+        assert wait_until(lambda: pub.last() is not None and pub.last().valid)
+        m = pub.last()
+        assert m.unmeasurable_slots and not m.order_checked and not m.order_ok
+        assert not m.place_valid and m.place_x == [0.0] * 8
+        assert m.occupied[0] and m.occupied[1]
     finally:
         rig.stop()

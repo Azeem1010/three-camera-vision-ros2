@@ -3,7 +3,7 @@
 <package format="3">
   <name>vision_interfaces</name>
   <version>0.1.0</version>
-  <description>雙機械手臂協同搬運系統：視覺節點對外的 ROS 2 service 介面定義</description>
+  <description>雙機械手臂協同搬運系統：視覺節點對外的 ROS 2 service 與 topic 訊息定義</description>
   <maintainer email="azeemlala0786@gmail.com">vision</maintainer>
   <license>Apache-2.0</license>
 

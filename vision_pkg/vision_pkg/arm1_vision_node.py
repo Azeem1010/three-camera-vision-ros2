@@ -11,6 +11,8 @@
       - 檢查可達範圍；peek_only=false 時通知環境相機把該物件標記為「已取走」
   * /vision/arm1/pick_target（topic，vision_interfaces/PickTarget）：以 process_hz 持續發布
     rank 最小的目標，算法同 get_pick_target(target_rank=0, peek_only=true)，不會標記已取走
+  * Topic /vision/arm1/detections（vision_interfaces/PickDetections）：每處理一張新影格發布一次，
+    含各正方形的像素 / A 站平面 / 手臂 1 基座座標（不含 rank，rank 仍需 get_pick_target）
 
 執行緒模型（避免 service 內呼叫 service 死鎖）：
   MultiThreadedExecutor；影像 / 處理計時器 / service 伺服端 / env 服務 client 各自放在
@@ -36,12 +38,13 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from vision_interfaces.msg import PickTarget
+from vision_interfaces.msg import PickDetections
 from vision_interfaces.srv import GetPickTarget, GetRank
 
 from vision_pkg import calib_io
 from vision_pkg.debug_draw import draw_poly, put_text
-from vision_pkg.node_common import (FlatParams, FrameBuffer, LatestValue, call_service,
-                                    image_msg_to_bgr, read_ros_params, spin_node)
+from vision_pkg.node_common import (FlatParams, FrameBuffer, LatestValue, call_service, image_msg_to_bgr,
+                                    image_problem, read_ros_params, spin_node, stamp)
 from vision_pkg.vision_core.color_zone import MaskParams, hsv_mask
 from vision_pkg.vision_core.geometry import apply_homography, polygon_mask
 from vision_pkg.vision_core.square_detect import Blob, SquareParams, describe_rejected, detect_squares
@@ -118,6 +121,7 @@ class Arm1VisionNode(Node):
         self.create_service(GetPickTarget, '/vision/arm1/get_pick_target', self._srv_pick, callback_group=g_srv)
         self.pub_target = self.create_publisher(PickTarget, '/vision/arm1/pick_target', 10)
         self.create_timer(1.0 / self.cfg.process_hz, self._on_publish, callback_group=g_pub)
+        self.pub_det = self.create_publisher(PickDetections, '/vision/arm1/detections', 10)
         self.get_logger().info(f'arm1_vision_node 就緒，訂閱 {self.P.s("image_topic")}')
 
     # ------------------------------------------------------------------ #
@@ -205,15 +209,18 @@ class Arm1VisionNode(Node):
             if w.poll():
                 self.get_logger().info(f'{name} 已重新載入（valid={w.value["valid"]}）')
         latest = self.frames.latest()
-        if latest is None:
+        problem = image_problem(latest, now, self.cfg.image_timeout_s)
+        if problem:
+            self._publish_invalid(problem)
             return
         seq, t_arr, frame = latest
-        if seq == self._last_seq or now - t_arr > self.cfg.image_timeout_s:
+        if seq == self._last_seq:
             return
         self._last_seq = seq
         hsv = self.hsv.value
         if hsv is None or 'orange' not in hsv:
             self.get_logger().error(f'HSV 設定不可用: {self.hsv.error}', throttle_duration_sec=10.0)
+            self._publish_invalid(f'HSV 設定不可用: {self.hsv.error}')
             return
         poly, roi = self._roi_for(frame.shape)
         mask = hsv_mask(frame, hsv['orange'], self.cfg.orange_mp)
@@ -221,7 +228,45 @@ class Arm1VisionNode(Node):
             mask = cv2.bitwise_and(mask, roi)
         squares, rejected = detect_squares(mask, self.cfg.square)
         self.detections.set(Detection(squares, rejected, poly))
+        self._publish(squares, rejected)
         self._render(frame, squares, rejected, poly)
+
+    # ------------------------------------------------------------------ #
+    def _publish_invalid(self, message: str) -> None:
+        m = PickDetections()
+        m.valid, m.message = False, message
+        self.pub_det.publish(stamp(self, m, CAM_NAME))
+
+    def _publish(self, squares: List[Blob], rejected: List[Blob]) -> None:
+        c = self.cfg
+        m = PickDetections()
+        m.valid = True
+        m.count = len(squares)
+        m.pixel_x = [float(s.cx) for s in squares]
+        m.pixel_y = [float(s.cy) for s in squares]
+        m.side_px = [float(s.side) for s in squares]
+        notes = [f'{len(squares)} 個正方形']
+        if rejected:
+            notes.append(f'{len(rejected)} 個橘色區塊被排除（{describe_rejected(rejected)}）')
+        px = np.array([[s.cx, s.cy] for s in squares], dtype=np.float64).reshape(-1, 2)
+        hp, ha = self.h_plane.value, self.h_arm.value
+        m.plane_valid = bool(hp is not None and hp['valid'])
+        if m.plane_valid and squares:
+            plane = apply_homography(hp['H'], px)
+            m.plane_x_mm = [float(v) for v in plane[:, 0]]
+            m.plane_y_mm = [float(v) for v in plane[:, 1]]
+        elif not m.plane_valid:
+            notes.append('a_station_homography 未標定')
+        m.base_valid = bool(ha is not None and ha['valid'])
+        if m.base_valid and squares:
+            base = apply_homography(ha['H'], px)
+            m.base_x = [float(v) for v in base[:, 0]]
+            m.base_y = [float(v) for v in base[:, 1]]
+        elif not m.base_valid:
+            notes.append('arm1_homography 未標定')
+        m.base_z = (c.station_height_mm + c.object_height_mm) / 1000.0
+        m.message = '；'.join(notes)
+        self.pub_det.publish(stamp(self, m, CAM_NAME))
 
     # ------------------------------------------------------------------ #
     def _fail(self, resp, msg: str):

@@ -216,6 +216,24 @@ class FlatParams:
 
 
 # --------------------------------------------------------------------------- #
+# Topic 發布
+# --------------------------------------------------------------------------- #
+def stamp(node, msg, frame_id: str):
+    """填入 header（stamp = 目前時間，frame_id = 相機名稱），回傳 msg 方便串接 publish。"""
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.header.frame_id = frame_id
+    return msg
+
+
+def image_problem(latest, now: float, timeout_s: float) -> str:
+    """影像來源異常的原因（尚未收到 / 已中斷）；正常時回傳空字串。latest = FrameBuffer.latest()。"""
+    if latest is None:
+        return '尚未收到影像'
+    age = now - latest[1]
+    return f'影像中斷 {age:.1f}s' if age > timeout_s else ''
+
+
+# --------------------------------------------------------------------------- #
 # Service 內呼叫另一個 service（不在回呼中 spin）
 # --------------------------------------------------------------------------- #
 def call_service(client, request, timeout_s: float) -> Tuple[Any, str]:
