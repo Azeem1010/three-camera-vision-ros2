@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """環境相機節點 env_vision_node。
 
+場地：60x30 cm 粉紅色泡棉板，由左至右 C | B | A 各 20x30 cm；物件：藍色圓形瓶蓋（直徑 20 mm，大小相同）。
+
 職責
   * 訂閱 /env_cam/image_raw（只訂閱 topic，絕不自己開 /dev/video）
-  * 開機（桌面淨空）時以 HSV 找出 A/B/C 站台，角點存入 zones.yaml；失敗則讀上次存檔並警告
-  * 持續判斷：各區有無物件、B 區是否有手臂；結果存成「最新狀態」，service 被呼叫時直接回傳
-  * 批次開始時拍快照（8 個物件由小到大排序）並提供 A 站平面座標 -> rank 的配對
+  * 開機（場地淨空）時找出粉紅色場地、均分成三區，角點存入 zones.yaml；失敗則讀上次存檔並警告
+  * 持續判斷：各區有無瓶蓋、B 區是否有手臂、C 區瓶蓋數；存成「最新狀態」，service 被呼叫時直接回傳
 
 Services（皆有逾時處理，失敗時 success=false 並附明確 message）
   /vision/env/recalibrate_zones   重新定位三區
   /vision/env/get_zone_state      a_has_object / b_has_object / b_arm_clear / c_object_count
-  /vision/env/capture_ranking     拍快照並排序
-  /vision/env/get_rank            輸入 A 站平面座標 -> rank（已取走者標記，避免重複配對）
-  /vision/env/clear_taken         （額外）清除「已取走」標記，供重試/復原使用
+  /vision/env/capture_ranking     此場地不排序：只清點 A 區瓶蓋數（count），保留介面相容
+  /vision/env/get_rank            此場地不排序：固定回 success=true、rank=0（保留介面相容）
+  /vision/env/clear_taken         此場地不排序：無作用，固定回 success=true
 
-Topics（service 保留不變；topic 是同一份結果的持續廣播）
+Topics
   /vision/env/zone_state   vision_interfaces/ZoneState        每處理一張新影格發布一次；影像中斷時 valid=false
-  /vision/env/ranking      vision_interfaces/RankingSnapshot  transient_local，快照或已取走標記改變時發布
+  /vision/env/ranking      vision_interfaces/RankingSnapshot  transient_local；固定 valid=false（不排序）
 
 執行緒模型：MultiThreadedExecutor；影像訂閱、處理計時器、service 伺服端各放在不同的
 MutuallyExclusiveCallbackGroup，service 等新影像時不會擋住影像接收。
 """
 from __future__ import annotations
 
-import math
 import sys
 import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -50,23 +50,22 @@ from vision_pkg import calib_io
 from vision_pkg.debug_draw import draw_poly, put_text
 from vision_pkg.node_common import (Debouncer, FlatParams, FrameBuffer, LatestValue, image_msg_to_bgr,
                                     image_problem, read_ros_params, spin_node, stamp)
-from vision_pkg.vision_core.color_zone import (FieldParams, HsvRange, MaskParams, OccupancyParams, ZoneFindParams,
-                                               ZoneRoi, count_blobs, judge_arm_present, judge_object_present,
-                                               locate_field_zones, locate_zones, make_roi, measure_zones)
+from vision_pkg.vision_core.color_zone import (FieldParams, MaskParams, OccupancyParams, ZoneFindParams, ZoneRoi,
+                                               count_blobs, hsv_mask, judge_arm_present, judge_object_present,
+                                               locate_field_zones, make_roi, measure_zones)
 from vision_pkg.vision_core.geometry import polygon_area
-from vision_pkg.vision_core.size_ranker import SizeRanker, make_ranker
-from vision_pkg.vision_core.snapshot import ObjectInfo, capture_snapshot, match_object
-from vision_pkg.vision_core.square_detect import SquareParams
 
 ZONES = ('a', 'b', 'c')
-ZONE_BGR = {'a': (255, 128, 0), 'b': (0, 200, 0), 'c': (220, 220, 220)}
+LEFT_TO_RIGHT = ('c', 'b', 'a')     # 目前場地在影像中由左至右的順序（field.reverse=false）
+ZONE_BGR = {'a': (255, 128, 0), 'b': (0, 200, 0), 'c': (0, 220, 255)}
 CAM_NAME = calib_io.CAMERA_NAMES['env']
+NO_RANKING = '此場地瓶蓋大小相同，不排序；放置順序由 C 區格位編號 1..8 決定'
 
 
 @dataclass
 class ZoneInfo:
     corners: np.ndarray     # (4,2) tl,tr,br,bl（影像像素）
-    baseline: float         # 淨空時站台色佔 ROI 的比例
+    baseline: float         # 淨空時場地色佔 ROI 的比例
     source: str             # 'detected' | 'loaded'
 
 
@@ -82,13 +81,6 @@ class ZoneState:
     detail: str = ''
 
 
-@dataclass
-class Snapshot:
-    objects: List[ObjectInfo]
-    low_confidence: bool = False
-    taken: Set[int] = field(default_factory=set)
-
-
 class EnvVisionNode(Node):
     def __init__(self):
         super().__init__('env_vision_node', automatically_declare_parameters_from_overrides=True)
@@ -99,7 +91,6 @@ class EnvVisionNode(Node):
         self._last_flat = dict(self.P.flat)
         self._last_param_check = 0.0
         self.cfg = self._build_cfg(self.P)
-        self.ranker: SizeRanker = self._make_ranker(self.cfg)
         self.show_debug = self.P.b('show_debug')
         self.calib_dir = calib_io.resolve_calib_dir(self.P.s('calib_dir'))
         self.get_logger().info(f'校正檔目錄: {self.calib_dir}')
@@ -110,7 +101,6 @@ class EnvVisionNode(Node):
         self._zones: Dict[str, ZoneInfo] = {}
         self._rois: Dict[str, ZoneRoi] = {}
         self._rois_key = None
-        self._snap: Optional[Snapshot] = None
         self._boot_done = False
         self._t_start = time.monotonic()
         self._last_seq = 0
@@ -149,8 +139,8 @@ class EnvVisionNode(Node):
         self.pub_ranking = self.create_publisher(
             RankingSnapshot, '/vision/env/ranking',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self._publish_ranking('尚未拍攝快照')
-        self.get_logger().info(f'env_vision_node 就緒，訂閱 {self.P.s("image_topic")}，等待影像與站台定位…')
+        self._publish_ranking()
+        self.get_logger().info(f'env_vision_node 就緒，訂閱 {self.P.s("image_topic")}，等待影像與場地定位…')
 
     # ------------------------------------------------------------------ #
     # 參數 / 設定
@@ -166,50 +156,26 @@ class EnvVisionNode(Node):
         c.boot_wait_s = P.f('boot_wait_s')
         c.min_baseline = P.f('min_baseline_ratio')
         c.erode = P.i('roi_erode_px')
-        c.zone_color = {z: P.s(f'zone_color.{z}') for z in ZONES}
-        c.locate_mode = P.s('zone_locate_mode')
-        if c.locate_mode not in ('field', 'color'):
-            raise ValueError(f'zone_locate_mode 必須是 field 或 color（目前 {c.locate_mode!r}）')
-        if c.locate_mode == 'field':
-            c.field = P.group(FieldParams, 'field')
-            if c.field.edge not in ('outer', 'inner'):
-                raise ValueError(f'field.edge 必須是 outer 或 inner（目前 {c.field.edge!r}）')
-            c.field_size = tuple(P.fl('field.size_mm'))
-            if len(c.field_size) != 2 or min(c.field_size) <= 0:
-                raise ValueError('field.size_mm 必須是兩個正數 [寬, 高]')
-            c.field_mp = P.group(MaskParams, 'field_mask')
-            # 各區尺寸由外框均分而來（只有一個來源，不會和 zone_size_mm 對不上）
-            c.zone_size = {z: (c.field_size[0] / len(ZONES), c.field_size[1]) for z in ZONES}
-        else:
-            c.zone_size = {z: tuple(P.fl(f'zone_size_mm.{z}')) for z in ZONES}
-        for z, s in c.zone_size.items():
-            if len(s) != 2 or min(s) <= 0:
-                raise ValueError(f'zone_size_mm.{z} 必須是兩個正數 [寬, 高]')
+        c.field = P.group(FieldParams, 'field')
+        c.field_size = tuple(P.fl('field.size_mm'))
+        if len(c.field_size) != 2 or min(c.field_size) <= 0:
+            raise ValueError('field.size_mm 必須是兩個正數 [寬, 高]')
+        c.zone_size = {z: (c.field_size[0] / len(ZONES), c.field_size[1]) for z in ZONES}   # 均分
+        c.field_mp = P.group(MaskParams, 'field_mask')
         c.zone_mp = P.group(MaskParams, 'zone_mask')
         c.zone_find = P.group(ZoneFindParams, 'zone_find')
-        c.orange_mp = P.group(MaskParams, 'orange_mask')
+        c.obj_color = P.s('object_color')
+        c.obj_mp = P.group(MaskParams, 'object_mask')
         c.black_mp = P.group(MaskParams, 'black_mask')
         c.occ = P.group(OccupancyParams, 'occupancy')
         c.obj_frames = P.i('debounce.object_frames')
         c.arm_present_frames = P.i('debounce.arm_present_frames')
         c.arm_clear_frames = P.i('debounce.arm_clear_frames')
-        c.count_min_mm2 = P.f('c_count.min_blob_area_mm2')
-        c.count_median = P.i('c_count.median_frames')
-        c.ppm = P.f('snapshot.warp_px_per_mm')
-        c.avg_frames = max(1, P.i('snapshot.avg_frames'))
-        c.expected = P.i('snapshot.expected_count')
-        c.square = P.group(SquareParams, 'square')
-        c.ranker_type = P.s('ranker.type')
-        c.margin_px = P.f('ranker.confidence_margin_px')
-        c.table = P.fl('ranker.table_mm')
-        c.table_tol = P.f('ranker.table_tolerance_mm')
-        c.match_mm = P.f('match_threshold_mm')
+        c.count_min_mm2 = P.f('object_count.min_blob_area_mm2')
+        c.count_median = P.i('object_count.median_frames')
+        c.avg_frames = max(1, P.i('capture.avg_frames'))
+        c.expected = P.i('capture.expected_count')
         return c
-
-    @staticmethod
-    def _make_ranker(c: SimpleNamespace) -> SizeRanker:
-        # 排序信心門檻的單位是「A 區校正後像素」，換成 mm 後交給 ranker（ranker 一律用 mm）
-        return make_ranker(c.ranker_type, c.margin_px / c.ppm, c.table, c.table_tol)
 
     def _make_debouncers(self) -> None:
         c = self.cfg
@@ -229,22 +195,21 @@ class EnvVisionNode(Node):
         self._last_flat = flat
         try:
             cfg = self._build_cfg(FlatParams(flat))
-            ranker = self._make_ranker(cfg)
         except Exception as e:
             self.get_logger().error(f'參數更新無效，沿用舊設定: {e}')
             return
-        self.cfg, self.ranker = cfg, ranker
+        self.cfg = cfg
         self._make_debouncers()
         self._rois_key = None
         self.get_logger().info('參數已更新')
 
-    def _ranges(self) -> Tuple[Optional[Dict[str, HsvRange]], str]:
-        """各站台的 HSV 範圍；hsv.yaml 缺顏色時回傳原因。"""
+    def _colors(self) -> Tuple[Optional[dict], str]:
+        """場地色 / 物件色 / 黑色 的 HSV 範圍；hsv.yaml 缺顏色時回傳原因。"""
         hsv = self.hsv.value
         if hsv is None:
             return None, f'HSV 設定載入失敗: {self.hsv.error}'
         try:
-            return {z: hsv[self.cfg.zone_color[z]] for z in ZONES}, ''
+            return {'field': hsv[self.cfg.field.color], 'obj': hsv[self.cfg.obj_color], 'black': hsv['black']}, ''
         except (KeyError, ValueError) as e:
             return None, f'hsv.yaml 缺少顏色 {e}'
 
@@ -261,19 +226,16 @@ class EnvVisionNode(Node):
             self.get_logger().warning(f'影像轉換失敗: {e}', throttle_duration_sec=5.0)
 
     # ------------------------------------------------------------------ #
-    # 站台定位
+    # 場地定位
     # ------------------------------------------------------------------ #
     def _locate_zones(self, frames: List[np.ndarray], source: str) -> Tuple[bool, str]:
-        """用多張影格定位三個站台；失敗的站台沿用現有/上次存檔值並警告。回傳 (三區皆成功, 說明)。"""
-        ranges, why = self._ranges()
-        if ranges is None:
+        """用多張影格定位場地並均分三區；失敗的區沿用現有/上次存檔值並警告。回傳 (三區皆成功, 說明)。"""
+        colors, why = self._colors()
+        if colors is None:
             return False, why
         c = self.cfg
-        if c.locate_mode == 'field':
-            res = locate_field_zones(frames, self.hsv.value['black'], ranges, c.field_mp, c.zone_mp, c.zone_find,
-                                     c.field, c.field_size, c.boot_min_det, c.erode, c.min_baseline)
-        else:
-            res = locate_zones(frames, ranges, c.zone_mp, c.zone_find, c.boot_min_det, c.erode, c.min_baseline)
+        res = locate_field_zones(frames, colors['field'], LEFT_TO_RIGHT, c.field_mp, c.zone_mp, c.zone_find,
+                                 c.field, c.field_size, c.boot_min_det, c.erode, c.min_baseline)
         saved = None
         msgs, all_ok, any_new = [], True, False
         with self._lock:
@@ -303,9 +265,6 @@ class EnvVisionNode(Node):
                     self.get_logger().error(f'[{source}] {z.upper()} 區偵測失敗且沒有上次存檔: {r.message}')
                     msgs.append(f'{z.upper()} 區失敗且無存檔: {r.message}')
             if any_new:
-                if self._snap is not None:
-                    self._snap = None  # 站台平面改了，舊快照作廢
-                    self._publish_ranking('站台已重新定位，舊快照作廢（請重新 capture_ranking）')
                 try:
                     h, w = frames[0].shape[:2]
                     calib_io.save_zones(self.calib_dir, (w, h),
@@ -335,7 +294,7 @@ class EnvVisionNode(Node):
                 for z, d in saved.items():
                     if z in ZONES:
                         self._zones[z] = ZoneInfo(d['corners'], d['baseline'], 'loaded')
-            self.get_logger().warning(f'等不到足夠影像（{self.cfg.boot_wait_s:.0f}s），改用上次存檔的站台（{len(saved)} 區）')
+            self.get_logger().warning(f'等不到足夠影像（{self.cfg.boot_wait_s:.0f}s），改用上次存檔的場地（{len(saved)} 區）')
             self._boot_done = True
 
     def _ensure_rois(self, shape) -> Optional[Dict[str, ZoneRoi]]:
@@ -348,6 +307,12 @@ class EnvVisionNode(Node):
             self._rois = {z: make_roi(shape, zones[z].corners, self.cfg.erode) for z in ZONES}
             self._rois_key = key
         return self._rois
+
+    def _count_in(self, obj_mask: np.ndarray, zone: str, rois: Dict[str, ZoneRoi], corners: np.ndarray) -> int:
+        """某區內的瓶蓋數（藍色塊數）。面積門檻由 mm² 換算成像素²（以該區四邊形的平均比例）。"""
+        w_mm, h_mm = self.cfg.zone_size[zone]
+        mm2_per_px = (w_mm * h_mm) / max(1.0, polygon_area(corners))
+        return count_blobs(cv2.bitwise_and(obj_mask, rois[zone].mask), self.cfg.count_min_mm2 / mm2_per_px)
 
     # ------------------------------------------------------------------ #
     # 持續處理
@@ -379,31 +344,25 @@ class EnvVisionNode(Node):
             return  # 沒有新影格
         self._last_seq = seq
 
-        ranges, why = self._ranges()
+        colors, why = self._colors()
         rois = self._ensure_rois(frame.shape)
-        if ranges is None:
+        if colors is None:
             self._set_state(ZoneState(False, why))
             return
         if rois is None:
-            self._set_state(ZoneState(False, '站台尚未定位（請在桌面淨空時呼叫 /vision/env/recalibrate_zones）'))
+            self._set_state(ZoneState(False, '場地尚未定位（請在場地淨空時呼叫 /vision/env/recalibrate_zones）'))
             self._render(frame, None, None, None)
             return
 
         c = self.cfg
-        hsv = self.hsv.value
         with self._lock:
             zones = dict(self._zones)
-        metrics, orange_mask = measure_zones(frame, rois, ranges, hsv['orange'], hsv['black'],
-                                             c.zone_mp, c.orange_mp, c.black_mp)
+        metrics, obj_mask = measure_zones(frame, rois, colors['field'], colors['obj'], colors['black'],
+                                          c.zone_mp, c.obj_mp, c.black_mp)
         a_raw, a_info = judge_object_present(metrics['a'], zones['a'].baseline, c.occ)
         b_raw, b_info = judge_object_present(metrics['b'], zones['b'].baseline, c.occ)
         arm_raw, arm_info = judge_arm_present(metrics['b'], zones['b'].baseline, c.occ)
-
-        # C 區橘色塊數：面積門檻由 mm² 換算成像素²（以站台四邊形平均比例）
-        w_mm, h_mm = c.zone_size['c']
-        mm2_per_px = (w_mm * h_mm) / max(1.0, polygon_area(zones['c'].corners))
-        in_c = cv2.bitwise_and(orange_mask, rois['c'].mask)
-        self._c_counts.append(count_blobs(in_c, c.count_min_mm2 / mm2_per_px))
+        self._c_counts.append(self._count_in(obj_mask, 'c', rois, zones['c'].corners))
 
         prev_arm = self._deb_arm.state
         a_obj = self._deb_a.update(a_raw)
@@ -415,7 +374,7 @@ class EnvVisionNode(Node):
         detail = f'A[{a_info}] B[{b_info}; {arm_info}] C[n={c_cnt}]'
         st = ZoneState(True, 'ok', bool(a_obj), bool(b_obj), not bool(arm), c_cnt, detail)
         self._set_state(st)
-        self._render(frame, st, orange_mask, rois)
+        self._render(frame, st, obj_mask, rois)
 
     # ------------------------------------------------------------------ #
     # Topics
@@ -433,22 +392,10 @@ class EnvVisionNode(Node):
         m.c_object_count = int(st.c_object_count)
         self.pub_state.publish(stamp(self, m, CAM_NAME))
 
-    def _publish_ranking(self, reason: str = '') -> None:
-        """發布目前快照（含已取走標記）；沒有快照時 valid=false，message = reason。"""
+    def _publish_ranking(self) -> None:
+        """此場地不排序：ranking topic 只發布一次 valid=false 與原因（transient_local，晚訂閱也收得到）。"""
         m = RankingSnapshot()
-        with self._lock:
-            snap = self._snap
-            objs = list(snap.objects) if snap else []
-            taken = set(snap.taken) if snap else set()
-            low = bool(snap.low_confidence) if snap else False
-        m.valid = snap is not None
-        m.message = f'{len(objs)} 個物件，已取走 {len(taken)} 個' if snap else (reason or '尚未拍攝快照')
-        m.low_confidence = low
-        m.rank = [int(o.rank) for o in objs]
-        m.x_mm = [float(o.x_mm) for o in objs]
-        m.y_mm = [float(o.y_mm) for o in objs]
-        m.side_mm = [float(o.side_mm) for o in objs]
-        m.taken = [i in taken for i in range(len(objs))]
+        m.valid, m.message = False, NO_RANKING
         self.pub_ranking.publish(stamp(self, m, CAM_NAME))
 
     # ------------------------------------------------------------------ #
@@ -489,20 +436,12 @@ class EnvVisionNode(Node):
         return resp
 
     def _srv_capture(self, req, resp):
+        """不排序：清點 A 區瓶蓋數。影像/場地有問題才回 success=false；數量不符只寫在 message。"""
         resp.count, resp.low_confidence = 0, False
         try:
-            with self._lock:
-                had_snap = self._snap is not None
-                self._snap = None   # 先作廢舊快照：這次若失敗，不能讓後面的 get_rank 配到上一批的資料
-                zone = self._zones.get('a')
-            if had_snap:
-                self._publish_ranking('快照拍攝中（舊快照已作廢）')
-            if zone is None:
-                resp.success, resp.message = False, 'A 站台尚未定位（請先呼叫 recalibrate_zones）'
-                return resp
-            hsv = self.hsv.value
-            if hsv is None:
-                resp.success, resp.message = False, f'HSV 設定載入失敗: {self.hsv.error}'
+            colors, why = self._colors()
+            if colors is None:
+                resp.success, resp.message = False, why
                 return resp
             c = self.cfg
             n = min(c.avg_frames, self.frames.maxlen)
@@ -512,56 +451,28 @@ class EnvVisionNode(Node):
                 resp.message = f'逾時：{c.service_timeout_s:.1f}s 內只收到 {len(frames)}/{n} 張新影像（影像中斷？）'
                 return resp
             img = frames[-1] if n == 1 else np.mean(np.stack(frames), axis=0, dtype=np.float32).astype(np.uint8)
-            res = capture_snapshot(img, zone.corners, c.zone_size['a'], c.ppm, hsv['orange'], c.orange_mp,
-                                   c.square, self.ranker, c.expected)
-            resp.success, resp.message = res.success, res.message
-            resp.count, resp.low_confidence = int(res.count), bool(res.low_confidence)
-            if res.success:
-                with self._lock:
-                    self._snap = Snapshot(res.objects, bool(res.low_confidence))
-                self.get_logger().info(f'快照完成: {res.count} 個物件，low_confidence={res.low_confidence}')
-                self._publish_ranking()
-            else:
-                self.get_logger().warning(f'快照失敗: {res.message}')
-                self._publish_ranking(f'快照失敗: {res.message}')
+            rois = self._ensure_rois(img.shape)
+            if rois is None:
+                resp.success, resp.message = False, '場地尚未定位（請先呼叫 recalibrate_zones）'
+                return resp
+            with self._lock:
+                corners = self._zones['a'].corners
+            count = self._count_in(hsv_mask(img, colors['obj'], c.obj_mp), 'a', rois, corners)
+            resp.success, resp.count = True, int(count)
+            resp.message = f'A 區 {count} 個瓶蓋；{NO_RANKING}'
+            if count != c.expected:
+                resp.message += f'（注意：預期 {c.expected} 個）'
         except Exception as e:
             self.get_logger().error('capture_ranking 例外:\n' + traceback.format_exc())
             resp.success, resp.message = False, f'內部錯誤: {e!r}'
         return resp
 
     def _srv_get_rank(self, req, resp):
-        resp.rank, resp.distance_mm = 0, 0.0
-        try:
-            if not (math.isfinite(req.x_mm) and math.isfinite(req.y_mm)):
-                resp.success, resp.message = False, '座標必須是有限數值'
-                return resp
-            with self._lock:
-                snap = self._snap
-                objs = list(snap.objects) if snap else []
-                taken = set(snap.taken) if snap else set()
-            if snap is None:
-                resp.success, resp.message = False, '尚未拍攝快照（請先 capture_ranking；或上次拍攝失敗）'
-                return resp
-            m = match_object(objs, taken, req.x_mm, req.y_mm, self.cfg.match_mm)
-            resp.success, resp.message = m.success, m.message
-            resp.rank, resp.distance_mm = int(m.rank), float(m.distance_mm)
-            if m.success and not req.peek_only:
-                with self._lock:
-                    snap.taken.add(m.index)
-                self._publish_ranking()
-        except Exception as e:
-            self.get_logger().error('get_rank 例外:\n' + traceback.format_exc())
-            resp.success, resp.message = False, f'內部錯誤: {e!r}'
+        resp.success, resp.message, resp.rank, resp.distance_mm = True, NO_RANKING + '；rank 固定為 0', 0, 0.0
         return resp
 
     def _srv_clear_taken(self, req, resp):
-        with self._lock:
-            n = len(self._snap.taken) if self._snap else 0
-            if self._snap:
-                self._snap.taken.clear()
-        if n:
-            self._publish_ranking()
-        resp.success, resp.message = True, f'已清除 {n} 個「已取走」標記'
+        resp.success, resp.message = True, NO_RANKING + '；沒有「已取走」標記需要清除'
         return resp
 
     # ------------------------------------------------------------------ #
@@ -570,22 +481,19 @@ class EnvVisionNode(Node):
     def get_debug_image(self) -> Optional[np.ndarray]:
         return self._debug_img
 
-    def _render(self, frame: np.ndarray, st: Optional[ZoneState], orange_mask: Optional[np.ndarray],
+    def _render(self, frame: np.ndarray, st: Optional[ZoneState], obj_mask: Optional[np.ndarray],
                 rois: Optional[Dict[str, ZoneRoi]]) -> None:
         if not self.show_debug:
             return
         img = frame.copy()
-        if orange_mask is not None and rois:   # 橘色物件輪廓（只畫站台範圍內的）
-            inside = np.zeros_like(orange_mask)
+        if obj_mask is not None and rois:   # 瓶蓋輪廓（只畫場地範圍內的）
+            inside = np.zeros_like(obj_mask)
             for roi in rois.values():
                 inside = cv2.bitwise_or(inside, roi.mask)
-            cnts, _ = cv2.findContours(cv2.bitwise_and(orange_mask, inside), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(img, [c for c in cnts if cv2.contourArea(c) >= 20], -1, (0, 128, 255), 1, cv2.LINE_AA)
+            cnts, _ = cv2.findContours(cv2.bitwise_and(obj_mask, inside), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(img, [c for c in cnts if cv2.contourArea(c) >= 20], -1, (0, 255, 255), 2, cv2.LINE_AA)
         with self._lock:
             zones = dict(self._zones)
-            snap = self._snap
-            objs = list(snap.objects) if snap else []
-            taken = set(snap.taken) if snap else set()
         labels = {z: z.upper() for z in ZONES}
         if st is not None and st.valid:
             labels['a'] = 'A: OBJECT' if st.a_has_object else 'A: empty'
@@ -594,11 +502,7 @@ class EnvVisionNode(Node):
         for z, info in zones.items():
             draw_poly(img, info.corners, ZONE_BGR[z], 2)
             put_text(img, labels[z] + (' (saved)' if info.source == 'loaded' else ''),
-                     (info.corners[0][0], info.corners[0][1] - 6), ZONE_BGR[z], 0.55, 1)
-        for i, o in enumerate(objs):
-            col = (128, 128, 128) if i in taken else (0, 255, 255)
-            cv2.circle(img, (int(o.px), int(o.py)), 4, col, -1, cv2.LINE_AA)
-            put_text(img, f'r{o.rank}' + ('x' if i in taken else ''), (o.px + 5, o.py - 5), col, 0.5, 1)
+                     (info.corners[0][0] + 4, info.corners[0][1] + 18), ZONE_BGR[z], 0.55, 1)
         status = 'zones OK' if len(zones) == 3 else 'ZONES MISSING'
         put_text(img, f'{status}  frame_age={self.frames.age() or 0:.2f}s  '
                       f'{"" if st is None or st.valid else "STATE INVALID"}', (8, 18), (255, 255, 255), 0.5, 1)

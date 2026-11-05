@@ -55,13 +55,13 @@ def test_zones_roundtrip(tmp_path):
 
 def test_hsv_override_is_per_color_and_reloads(tmp_path):
     base = calib_io.load_hsv_ranges(tmp_path)
-    assert set(base) >= {'blue', 'green', 'c_zone', 'orange', 'black'}
+    assert set(base) >= {'pink', 'blue', 'black'}
     new = HsvRange((1, 2, 3), (4, 5, 6))
-    calib_io.save_hsv_range(tmp_path, 'orange', new)
+    calib_io.save_hsv_range(tmp_path, 'pink', new)
     over = calib_io.load_hsv_ranges(tmp_path)
-    assert over['orange'] == new and over['blue'] == base['blue']        # 只覆寫 orange
+    assert over['pink'] == new and over['blue'] == base['blue']        # 只覆寫 pink
     calib_io.save_hsv_range(tmp_path, 'blue', HsvRange((9, 9, 9), (10, 10, 10)))
-    assert calib_io.load_hsv_ranges(tmp_path)['orange'] == new            # 先前的覆寫不會被洗掉
+    assert calib_io.load_hsv_ranges(tmp_path)['pink'] == new            # 先前的覆寫不會被洗掉
 
 
 def test_reloadable_config_detects_changes_and_keeps_old_value_on_error(tmp_path):

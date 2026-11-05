@@ -10,11 +10,11 @@ DATA = Path(__file__).resolve().parent / 'data'
 
 SCENES = {
     'env_empty.png': lambda: S.make_env_scene(),
-    'env_a_8objects.png': lambda: S.make_env_scene(a_objs=S.a_objects()),
-    'env_a_7objects.png': lambda: S.make_env_scene(a_objs=S.a_objects(skip=[3])),
+    'env_a_8caps.png': lambda: S.make_env_scene(a_caps=S.A_CAPS_MM),
+    'env_c_3caps.png': lambda: S.make_env_scene(a_caps=S.A_CAPS_MM[3:], filled_slots=[1, 2, 3]),
     'env_b_arm.png': lambda: S.make_env_scene(arm_in_b=True),
-    'arm2_c_ascending.png': lambda: S.make_arm2_scene([28, 30, 32, 34, 36, 38, 40, 42]),
-    'arm2_c_wrong_order.png': lambda: S.make_arm2_scene([28, 30, 38, 34, 36, 32, 40, 42]),
+    'arm2_c_empty.png': lambda: S.make_arm2_scene(),
+    'arm2_c_slots_1_2_3.png': lambda: S.make_arm2_scene([1, 2, 3]),
 }
 
 

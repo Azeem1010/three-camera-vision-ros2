@@ -4,6 +4,7 @@
 然後直接呼叫 service 回呼，驗證回應內容、逾時與失敗處理。
 fake_ros 會模擬 rclpy 訊息欄位的嚴格型別檢查，能抓到 float 欄位塞 int、numpy.bool_ 等真實 ROS 才會報的錯。
 """
+import math
 import threading
 import time
 from pathlib import Path
@@ -21,7 +22,7 @@ from vision_pkg import arm1_vision_node as arm1_mod  # noqa: E402
 from vision_pkg import arm2_vision_node as arm2_mod  # noqa: E402
 from vision_pkg import calib_io  # noqa: E402
 from vision_pkg import env_vision_node as env_mod  # noqa: E402
-from vision_pkg.vision_core.geometry import apply_homography, plane_homography  # noqa: E402
+from vision_pkg.vision_core.geometry import apply_homography  # noqa: E402
 from vision_pkg.vision_core.params_util import load_ros_params_yaml  # noqa: E402
 
 CONFIG = Path(__file__).resolve().parents[1] / 'config'
@@ -83,10 +84,8 @@ class Rig:
             t.join(timeout=2.0)
 
 
-def make_node(cls, name, yaml_name, tmp_path, legacy=True, **over):
+def make_node(cls, name, yaml_name, tmp_path, **over):
     flat = load_ros_params_yaml(CONFIG / yaml_name)
-    if yaml_name == 'env_vision.yaml' and legacy:
-        flat.update(S.LEGACY_ENV_PARAMS)   # 舊合成場景是三塊彩色站台；legacy=False 用 YAML 原樣（field 模式）
     flat.update({'show_debug': False, 'calib_dir': str(tmp_path), 'service_timeout_s': 1.0,
                  'image_timeout_s': 0.5})
     flat.update(over)
@@ -111,19 +110,29 @@ def save_h(tmp_path, name, H, unit):
                              apply_homography(H, px), 0.0, False)
 
 
+def _env(tmp_path, **over):
+    return make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path, **over)
+
+
+def _zs(node):
+    return call(node, '/vision/env/get_zone_state')
+
+
 # --------------------------------------------------------------------------- #
 # 環境相機節點
 # --------------------------------------------------------------------------- #
 def test_env_boot_locates_zones_saves_file_and_reports_state(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+    node = _env(tmp_path)
     rig = Rig(node, env_scenes['empty']).start()
     try:
         assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
         assert all(z.source == 'detected' for z in node._zones.values())
         assert (tmp_path / 'zones.yaml').exists()
+        for z in 'abc':
+            assert np.abs(node._zones[z].corners - S.zone_corners_img(z)).max() < 3.0
         # 手臂預設視為「在場」，要連續幾次確認 clear 才放行（安全優先）
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 4)
-        r = call(node, '/vision/env/get_zone_state')
+        assert wait_until(lambda: _zs(node).b_arm_clear, 4)
+        r = _zs(node)
         assert r.success, r.message
         assert (r.a_has_object, r.b_has_object, r.c_object_count) == (False, False, 0)
         assert any(' 區定位成功' in t for _, t in node.get_logger().records)
@@ -131,85 +140,60 @@ def test_env_boot_locates_zones_saves_file_and_reports_state(tmp_path, env_scene
         rig.stop()
 
 
-def test_env_objects_and_arm_are_reported(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+def test_env_caps_and_arm_are_reported(tmp_path, env_scenes):
+    node = _env(tmp_path)
     rig = Rig(node, env_scenes['empty']).start()
     try:
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 6)
-        rig.set_scene(S.make_env_scene(a_objs=S.a_objects(), c_objs=[(40, 40, 30, 0), (150, 60, 30, 20)]))
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').a_has_object, 4)
-        r = call(node, '/vision/env/get_zone_state')
-        assert r.success and r.a_has_object and not r.b_has_object and r.c_object_count == 2
+        assert wait_until(lambda: _zs(node).b_arm_clear, 6)
+        rig.set_scene(env_scenes['c3'])
+        assert wait_until(lambda: _zs(node).a_has_object and _zs(node).c_object_count == 3, 4)
+        assert not _zs(node).b_has_object
+
+        rig.set_scene(S.make_env_scene(b_caps=[(300, 150)]))       # 瓶蓋在 B 區
+        assert wait_until(lambda: _zs(node).b_has_object and not _zs(node).a_has_object, 4)
+        assert _zs(node).b_arm_clear
 
         rig.set_scene(env_scenes['b_arm'])   # 手臂進入 B 區：偵測到後立刻回報（不經 clear 去彈跳）
-        assert wait_until(lambda: not call(node, '/vision/env/get_zone_state').b_arm_clear, 3)
-        assert not call(node, '/vision/env/get_zone_state').b_has_object
+        assert wait_until(lambda: not _zs(node).b_arm_clear, 3)
+        assert wait_until(lambda: not _zs(node).b_has_object, 3)   # 手臂不是物件（物件旗標有去彈跳，晚幾格才清掉）
+        assert not _zs(node).b_arm_clear
         rig.set_scene(env_scenes['empty'])   # 離開：需連續確認才回報 clear
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 6)
+        assert wait_until(lambda: _zs(node).b_arm_clear, 6)
     finally:
         rig.stop()
 
 
-def test_env_ranking_get_rank_and_taken_marking(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
-    rig = Rig(node, env_scenes['empty']).start()
-    try:
-        assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
-        rig.set_scene(env_scenes['a8'])
-        r = call(node, '/vision/env/capture_ranking')
-        assert r.success, r.message
-        assert r.count == 8 and not r.low_confidence
-
-        x, y = S.A_POSITIONS[S.A_PERM[2]]          # 第 3 小（28mm）物件的真實位置
-        g = call(node, '/vision/env/get_rank', x_mm=float(x + 3), y_mm=float(y - 2), peek_only=True)
-        assert g.success and g.rank == 3 and g.distance_mm < 5.0
-        again = call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y), peek_only=True)
-        assert again.success and again.rank == 3          # peek 不會標記
-
-        g = call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y))   # 標記已取走
-        assert g.success and g.rank == 3
-        dup = call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y))
-        assert not dup.success and '已被標記為取走' in dup.message and dup.rank == 0
-
-        far = call(node, '/vision/env/get_rank', x_mm=100.0, y_mm=100.0)     # 中央沒有物件
-        assert not far.success and '門檻' in far.message
-
-        c = call(node, '/vision/env/clear_taken')
-        assert c.success and '1' in c.message
-        assert call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y), peek_only=True).success
-
-        bad = call(node, '/vision/env/get_rank', x_mm=float('nan'), y_mm=1.0)
-        assert not bad.success
-    finally:
-        rig.stop()
-
-
-def test_env_capture_failure_does_not_guess_and_invalidates_old_snapshot(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+def test_env_ranking_services_are_kept_but_do_not_rank(tmp_path, env_scenes):
+    node = _env(tmp_path)
+    pub = node.pubs['/vision/env/ranking']
+    assert pub.qos.durability == 'transient_local'
+    m = pub.last()
+    assert not m.valid and '不排序' in m.message and list(m.rank) == []
     rig = Rig(node, env_scenes['a8']).start()
     try:
         assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
-        assert call(node, '/vision/env/capture_ranking').success
-        rig.set_scene(env_scenes['a7'])
         r = call(node, '/vision/env/capture_ranking')
-        assert not r.success and r.count == 7 and '預期 8' in r.message
-        x, y = S.A_POSITIONS[S.A_PERM[0]]
-        g = call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y))
-        assert not g.success and '尚未拍攝快照' in g.message
+        assert r.success and r.count == 8 and not r.low_confidence and '不排序' in r.message, r.message
+        rig.set_scene(env_scenes['c3'])
+        time.sleep(0.2)
+        r = call(node, '/vision/env/capture_ranking')
+        assert r.success and r.count == 5 and '預期 8' in r.message      # 數量不符只提醒、不失敗
+        g = call(node, '/vision/env/get_rank', x_mm=10.0, y_mm=10.0)
+        assert g.success and g.rank == 0 and g.distance_mm == 0.0
+        assert call(node, '/vision/env/clear_taken').success
     finally:
         rig.stop()
 
 
 def test_env_services_time_out_cleanly_when_images_stop(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path,
-                     **{'service_timeout_s': 0.4})
+    node = _env(tmp_path, service_timeout_s=0.4)
     rig = Rig(node, env_scenes['empty']).start()
     try:
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 6)
+        assert wait_until(lambda: _zs(node).b_arm_clear, 6)
         rig.paused = True                       # 影像中斷
         time.sleep(0.7)
         t0 = time.time()
-        r = call(node, '/vision/env/get_zone_state')
+        r = _zs(node)
         assert not r.success and '過期' in r.message and not r.b_arm_clear
         assert time.time() - t0 < 1.5           # 守住逾時，不會卡死
         c = call(node, '/vision/env/capture_ranking')
@@ -221,16 +205,16 @@ def test_env_services_time_out_cleanly_when_images_stop(tmp_path, env_scenes):
 
 
 def test_env_recalibrate_and_fallback_to_saved_zones(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+    node = _env(tmp_path)
     rig = Rig(node, env_scenes['empty']).start()
     try:
         assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
         r = call(node, '/vision/env/recalibrate_zones')
         assert r.success, r.message
         assert 'A 區定位成功' in r.message and 'C 區定位成功' in r.message
-        # 桌面被遮住（顏色全看不到）：重新定位失敗，沿用舊 ROI 並說明原因
-        blank = S.make_env_scene()
-        blank[:] = S.WOOD
+        # 場地被移走（只剩桌面）：重新定位失敗，沿用舊 ROI 並說明原因
+        blank = env_scenes['empty'].copy()
+        blank[:] = S.DESK
         rig.set_scene(blank)
         time.sleep(0.3)
         r = call(node, '/vision/env/recalibrate_zones')
@@ -240,20 +224,18 @@ def test_env_recalibrate_and_fallback_to_saved_zones(tmp_path, env_scenes):
         rig.stop()
 
     # 新節點：沒有影像可用 -> 讀上次存檔
-    node2 = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path,
-                      **{'boot_wait_s': 0.2})
+    node2 = _env(tmp_path, boot_wait_s=0.2)
     time.sleep(0.3)
     node2._on_tick()
     assert node2._boot_done and len(node2._zones) == 3
     assert all(z.source == 'loaded' for z in node2._zones.values())
     assert any('上次存檔' in t for _, t in node2.get_logger().records)
-    r = call(node2, '/vision/env/get_zone_state')    # 沒有影像：回 false 並說明，不崩潰
+    r = _zs(node2)    # 沒有影像：回 false 並說明，不崩潰
     assert not r.success and r.message
 
 
 def test_env_without_any_saved_zones_reports_clear_error(tmp_path):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path,
-                     **{'boot_wait_s': 0.1, 'service_timeout_s': 0.3})
+    node = _env(tmp_path, boot_wait_s=0.1, service_timeout_s=0.3)
     time.sleep(0.2)
     node._on_tick()
     assert node._boot_done and not node._zones
@@ -262,416 +244,40 @@ def test_env_without_any_saved_zones_reports_clear_error(tmp_path):
         assert not r.success and r.message
 
 
-def test_env_live_parameter_update_and_bad_value_is_rejected(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
-    assert node.cfg.match_mm == 20.0
-    node.set_param('match_threshold_mm', 5.0)
+def test_env_live_parameter_update_and_bad_value_is_rejected(tmp_path):
+    node = _env(tmp_path)
+    assert node.cfg.occ.object_ratio_thresh == 0.002
+    node.set_param('occupancy.object_ratio_thresh', 0.01)
     node._refresh_cfg(time.monotonic() + 10)
-    assert node.cfg.match_mm == 5.0
-    node.set_param('square.max_aspect', 'abc')
+    assert node.cfg.occ.object_ratio_thresh == 0.01
+    node.set_param('field.min_aspect', 'abc')
     node._refresh_cfg(time.monotonic() + 20)
-    assert node.cfg.match_mm == 5.0
+    assert node.cfg.occ.object_ratio_thresh == 0.01
     assert any('參數更新無效' in t for _, t in node.get_logger().records)
 
 
 def test_env_missing_parameter_is_reported_with_its_name(tmp_path):
     flat = load_ros_params_yaml(CONFIG / 'env_vision.yaml')
-    del flat['match_threshold_mm']
+    del flat['object_color']
     FakeNode.overrides['env_vision_node'] = flat
     try:
         env_mod.EnvVisionNode()
         assert False, '應該要丟 KeyError'
     except KeyError as e:
-        assert 'match_threshold_mm' in str(e)
+        assert 'object_color' in str(e)
 
 
-def test_env_field_mode_end_to_end(tmp_path):
-    """field 模式（YAML 預設）：黑色外框場地 -> 三區定位、占用/手臂判斷、A 區排序與座標配對。"""
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path, legacy=False)
-    assert node.cfg.zone_size['a'] == (200.0, 300.0)
-    rig = Rig(node, S.make_field_scene()).start()
-    try:
-        assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
-        assert all(z.source == 'detected' for z in node._zones.values())
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').b_arm_clear, 6)
-        r = call(node, '/vision/env/get_zone_state')
-        assert r.success and (r.a_has_object, r.b_has_object, r.c_object_count) == (False, False, 0), r.message
-
-        rig.set_scene(S.make_field_scene(a_objs=S.a_objects()))
-        assert wait_until(lambda: call(node, '/vision/env/get_zone_state').a_has_object, 4)
-        r = call(node, '/vision/env/capture_ranking')
-        assert r.success and r.count == 8, r.message
-        x, y = S.A_POSITIONS[S.A_PERM[2]]            # 第 3 小的物件；A 區平面座標要加上位移
-        ox, oy = S.FIELD_A_OFFSET_MM
-        g = call(node, '/vision/env/get_rank', x_mm=float(x + ox), y_mm=float(y + oy), peek_only=True)
-        assert g.success and g.rank == 3 and g.distance_mm < 5.0, g.message
-
-        rig.set_scene(S.make_field_scene(b_arm=True))
-        assert wait_until(lambda: not call(node, '/vision/env/get_zone_state').b_arm_clear, 3)
-    finally:
-        rig.stop()
-
-
-# --------------------------------------------------------------------------- #
-# 手眼相機 1 節點（與環境相機節點串接）
-# --------------------------------------------------------------------------- #
-def _arm1_setup(tmp_path, env_scenes, **arm1_over):
-    """env 節點先拍好快照；arm1 的 get_rank client 接到 env 節點的 service 回呼。"""
-    H_plane = plane_homography(S.ENV_ZONES['a'], *S.ZONE_SIZE_MM)           # 像素 -> A 站平面 mm
-    T = np.array([[0.001, 0, 0.10], [0, 0.001, 0.05], [0, 0, 1.0]])         # mm -> 手臂 1 基座 m（平移 0.10, 0.05）
-    save_h(tmp_path, 'a_station_homography', H_plane, 'mm')
-    save_h(tmp_path, 'arm1_homography', T @ H_plane, 'm')
-
-    env = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
-    env_rig = Rig(env, env_scenes['a8']).start()
-    assert wait_until(lambda: len(env._zones) == 3 and env._boot_done)
-    assert call(env, '/vision/env/capture_ranking').success
-
-    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
-                     **{'env_call_timeout_s': 0.5, 'square.min_area_px': 150.0,   # 合成圖裡的物件比真實手眼相機看到的小
-                        **arm1_over})
-    arm1.cli_rank.handler = lambda req: env.services['/vision/env/get_rank'](req, SRV['GetRank'].Response())
-    arm1_rig = Rig(arm1, env_scenes['a8']).start()
-    return env, env_rig, arm1, arm1_rig
-
-
-def _pick(arm1, **fields):
-    return call(arm1, '/vision/arm1/get_pick_target', **fields)
-
-
-def test_arm1_picks_smallest_rank_with_base_coordinates(tmp_path, env_scenes):
-    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
-    try:
-        r = _pick(arm1, peek_only=True)
-        assert r.success, r.message
-        assert r.rank == 1
-        x, y = S.A_POSITIONS[S.A_PERM[0]]                      # 最小（20mm）物件的真實位置
-        assert abs(r.x - (0.10 + x / 1000.0)) < 0.004 and abs(r.y - (0.05 + y / 1000.0)) < 0.004
-        assert abs(r.z - 0.03) < 1e-9                           # 站台高度 0 + 物件高度 30mm
-        assert 'peek_only' in r.message
-
-        r = _pick(arm1, target_rank=5, peek_only=True)
-        x5, y5 = S.A_POSITIONS[S.A_PERM[4]]
-        assert r.success and r.rank == 5 and abs(r.x - (0.10 + x5 / 1000.0)) < 0.004
-
-        r = _pick(arm1, target_rank=9, peek_only=True)
-        assert not r.success and '不在可見物件中' in r.message
-        assert not _pick(arm1, target_rank=-1).success
-    finally:
-        arm1_rig.stop(); env_rig.stop()
-
-
-def test_arm1_marks_taken_and_never_returns_the_same_object_twice(tmp_path, env_scenes):
-    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
-    try:
-        r = _pick(arm1)                                         # 預設：取走 rank 1 並通知 env 標記
-        assert r.success and r.rank == 1
-        # 物件還在畫面上（還沒真的被拿走）：env 說它已被取走 -> 不猜測，回報失敗
-        r2 = _pick(arm1)
-        assert not r2.success and '無法配對' in r2.message and '已被標記為取走' in r2.message
-        r3 = _pick(arm1, target_rank=2)                         # 指定其他 rank 仍可取
-        assert r3.success and r3.rank == 2
-
-        # 物件被實際拿走（畫面上少了 rank 1、rank 2）-> 預設取剩下最小的 rank 3
-        gone = S.make_env_scene(a_objs=S.a_objects(skip=[0, 1]))
-        arm1_rig.set_scene(gone)
-        time.sleep(0.4)
-        r4 = _pick(arm1)
-        assert r4.success and r4.rank == 3
-
-        # 重試復原：清掉標記後，被誤標記的物件可再被查到
-        call(env, '/vision/env/clear_taken')
-        arm1_rig.set_scene(env_scenes['a8'])
-        time.sleep(0.4)
-        r5 = _pick(arm1, peek_only=True)
-        assert r5.success and r5.rank == 1
-    finally:
-        arm1_rig.stop(); env_rig.stop()
-
-
-def test_arm1_reports_reach_homography_and_env_failures(tmp_path, env_scenes):
-    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
-    try:
-        arm1.set_param('reach.max_m', 0.2)
-        arm1._refresh_cfg(time.monotonic() + 10)
-        r = _pick(arm1)
-        assert not r.success and '超出可達範圍' in r.message
-        # 超出可達範圍時不可標記為已取走：恢復範圍後仍可取到 rank 1
-        arm1.set_param('reach.max_m', 0.35)
-        arm1._refresh_cfg(time.monotonic() + 20)
-        assert _pick(arm1).rank == 1
-
-        arm1.cli_rank.handler = None                              # env 節點沒啟動
-        r = _pick(arm1)
-        assert not r.success and '未就緒' in r.message
-
-        def slow(req):
-            time.sleep(1.0)
-            return SRV['GetRank'].Response()
-        arm1.cli_rank.handler = slow                              # env 回應太慢
-        t0 = time.time()
-        r = _pick(arm1)
-        assert not r.success and '逾時' in r.message and time.time() - t0 < 1.5
-        assert arm1.cli_rank.removed >= 1                         # 逾時後有清掉 pending request
-
-        arm1_rig.set_scene(S.make_env_scene())                    # A 區沒東西
-        time.sleep(0.4)
-        arm1.cli_rank.handler = lambda req: env.services['/vision/env/get_rank'](req, SRV['GetRank'].Response())
-        r = _pick(arm1)
-        assert not r.success and '沒有偵測到橘色正方形' in r.message
-    finally:
-        arm1_rig.stop(); env_rig.stop()
-
-
-def _publish(node, topic):
-    """手動觸發節點的發布計時器（Rig 只跑處理計時器 timers[0]），回傳剛發布的訊息。"""
-    node.timers[1][1]()
-    return node.publishers[topic].msgs[-1]
-
-
-def test_arm1_topic_publishes_smallest_rank_without_marking_taken(tmp_path, env_scenes):
-    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
-    try:
-        assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').success)
-        m = _publish(arm1, '/vision/arm1/pick_target')
-        x, y = S.A_POSITIONS[S.A_PERM[0]]
-        assert m.rank == 1 and m.header.frame_id == 'arm1_base'
-        assert abs(m.x - (0.10 + x / 1000.0)) < 0.004 and abs(m.y - (0.05 + y / 1000.0)) < 0.004
-        assert abs(m.z - 0.03) < 1e-9 and list(m.visible_ranks) == list(range(1, 9))
-        assert _publish(arm1, '/vision/arm1/pick_target').rank == 1   # 一直發布也不會把 rank 1 標記成已取走
-
-        assert _pick(arm1).rank == 1                                  # service 照舊：取走 rank 1 並標記
-        m = _publish(arm1, '/vision/arm1/pick_target')                # rank 1 還在畫面上但已標記 -> 不猜測
-        assert not m.success and '無法確定最小者' in m.message
-
-        arm1_rig.set_scene(S.make_env_scene(a_objs=S.a_objects(skip=[0])))   # rank 1 被實際拿走
-        assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').rank == 2, 4)
-    finally:
-        arm1_rig.stop(); env_rig.stop()
-
-
-def test_arm1_topic_reports_failure_when_no_images(tmp_path):
-    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path)
-    m = _publish(arm1, '/vision/arm1/pick_target')
-    assert not m.success and m.message and m.rank == 0
-
-
-def test_arm1_without_homography_or_images_fails_gracefully(tmp_path, env_scenes):
-    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
-                     **{'service_timeout_s': 0.3})
-    r = _pick(arm1)                                               # 完全沒有影像
-    assert not r.success and r.message
-    rig = Rig(arm1, env_scenes['a8']).start()
-    try:
-        assert wait_until(lambda: arm1.detections.peek()[0] is not None)
-        r = _pick(arm1)                                           # 有影像但 homography 還是範本（valid=false）
-        assert not r.success and '尚未標定' in r.message
-    finally:
-        rig.stop()
-
-
-# --------------------------------------------------------------------------- #
-# 手眼相機 2 節點
-# --------------------------------------------------------------------------- #
-ASC = [28, 30, 32, 34, 36, 38, 40, 42]
-
-
-def _arm2_node(tmp_path, with_h=True, **over):
-    if with_h:
-        H = plane_homography(S.ARM2_C, *S.C_SIZE_MM)
-        T = np.array([[0.001, 0, 0.20], [0, 0.001, -0.10], [0, 0, 1.0]])   # mm -> 手臂 2 基座 m
-        save_h(tmp_path, 'arm2_homography', T @ H, 'm')
-    return make_node(arm2_mod.Arm2VisionNode, 'arm2_vision_node', 'arm2_vision.yaml', tmp_path,
-                     **{'c_station_size_mm': list(S.C_SIZE_MM), **over})
-
-
-def test_arm2_grid_state_gives_occupancy_and_place_coordinates(tmp_path):
-    node = _arm2_node(tmp_path)
-    rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert r.success, r.message
-        assert list(r.occupied) == [True, False, True, True, False, True, True, True]
-        assert not r.all_full
-        # 格位 1 中心 = 平面 (25,25)mm、格位 8 中心 = (175,75)mm  -> 基座 = 平面/1000 + (0.20, -0.10)
-        assert abs(r.place_x[0] - 0.225) < 0.004 and abs(r.place_y[0] - (-0.075)) < 0.004
-        assert abs(r.place_x[7] - 0.375) < 0.004 and abs(r.place_y[7] - (-0.025)) < 0.004
-        assert all(abs(z - 0.03) < 1e-9 for z in r.place_z)
-
-        rig.set_scene(S.make_arm2_scene(ASC))
-        assert wait_until(lambda: call(node, '/vision/arm2/get_grid_state').all_full, 4)
-    finally:
-        rig.stop()
-
-
-def test_arm2_topic_matches_grid_state_service(tmp_path):
-    node = _arm2_node(tmp_path)
-    pub = node.pubs['/vision/arm2/grid_state']
-    node._on_tick()                                               # 還沒有影像：照樣發布失敗與原因
-    m = pub.last()
-    assert not m.valid and '尚未收到影像' in m.message and list(m.occupied) == [False] * 8
-    rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
-    try:
-        assert wait_until(lambda: pub.last().valid)
-        m = pub.last()
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert m.header.frame_id == 'arm2_base'
-        assert list(m.occupied) == list(r.occupied) == [True, False, True, True, False, True, True, True]
-        assert all(abs(a - b) < 1e-6 for a, b in zip(m.place_x, r.place_x))
-        assert abs(m.place_x[0] - 0.225) < 0.004 and not m.all_full
-    finally:
-        rig.stop()
-
-
-def test_arm2_verify_place_order_check(tmp_path):
-    node = _arm2_node(tmp_path)
-    rig = Rig(node, S.make_arm2_scene(ASC)).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        r = call(node, '/vision/arm2/verify_place', slot=3)
-        assert r.success and r.placed and r.order_ok and list(r.wrong_slots) == []
-
-        rig.set_scene(S.make_arm2_scene([28, 30, 38, 34, 36, 32, 40, 42]))     # 格位 3 與 6 放錯
-        assert wait_until(lambda: not call(node, '/vision/arm2/verify_place', slot=3).order_ok, 4)
-        r = call(node, '/vision/arm2/verify_place', slot=3)
-        assert r.success and r.placed and not r.order_ok and list(r.wrong_slots) == [3, 6]
-        assert '3' in r.message and '6' in r.message
-
-        rig.set_scene(S.make_arm2_scene([28, None, 32, None, None, 38, None, 42]))   # 部分放置，順序正確
-        assert wait_until(lambda: not call(node, '/vision/arm2/verify_place', slot=2).placed, 4)
-        r = call(node, '/vision/arm2/verify_place', slot=2)
-        assert r.success and not r.placed and r.order_ok
-        r = call(node, '/vision/arm2/verify_place', slot=3)
-        assert r.success and r.placed
-
-        for bad in (0, 9, -1):
-            r = call(node, '/vision/arm2/verify_place', slot=bad)
-            assert not r.success and '1..8' in r.message
-    finally:
-        rig.stop()
-
-
-def test_arm2_refuses_to_guess_when_objects_touch(tmp_path):
-    node = _arm2_node(tmp_path)
-    rig = Rig(node, S.make_arm2_scene([42, 42, None, None, None, None, None, None],
-                                      extra_objs=[(50, 25, 20, 0)])).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        r = call(node, '/vision/arm2/verify_place', slot=1)
-        assert not r.success and '無法量測邊長' in r.message and '不猜測' in r.message
-        assert r.placed       # 占用狀態仍如實回報
-    finally:
-        rig.stop()
-
-
-def test_arm2_without_homography_still_reports_occupancy_but_not_success(tmp_path):
-    node = _arm2_node(tmp_path, with_h=False)
-    rig = Rig(node, S.make_arm2_scene(ASC)).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert not r.success and '尚未標定' in r.message
-        assert list(r.occupied) == [True] * 8 and r.all_full
-        assert call(node, '/vision/arm2/verify_place', slot=1).success    # 驗證放置不需要座標
-    finally:
-        rig.stop()
-
-
-def test_arm2_zone_lost_and_image_timeout(tmp_path):
-    node = _arm2_node(tmp_path, **{'corner_hold_s': 0.3, 'service_timeout_s': 0.4})
-    rig = Rig(node, S.make_arm2_scene(ASC)).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        blank = S.make_arm2_scene(ASC)
-        blank[:] = S.WOOD
-        rig.set_scene(blank)
-        assert wait_until(lambda: not call(node, '/vision/arm2/get_grid_state').success, 4)
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert not r.success and 'C 區定位失敗' in r.message
-        assert list(r.occupied) == [False] * 8
-
-        rig.set_scene(S.make_arm2_scene(ASC))
-        assert wait_until(lambda: call(node, '/vision/arm2/get_grid_state').success, 4)
-        rig.paused = True                                               # 影像中斷
-        time.sleep(0.7)
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert not r.success and '過期' in r.message
-    finally:
-        rig.stop()
-
-
-def test_arm2_rotation_parameter_aligns_slot_numbers(tmp_path):
-    sides = [28, None, 32, 34, 36, None, 40, 42]
-    node = _arm2_node(tmp_path, **{'warp_rotation_k': 2})
-    rig = Rig(node, S.make_arm2_scene(sides, rotation_k=2)).start()
-    try:
-        assert wait_until(lambda: node.results.peek()[0] is not None and node.results.peek()[0].valid)
-        r = call(node, '/vision/arm2/get_grid_state')
-        assert list(r.occupied) == [s is not None for s in sides]
-    finally:
-        rig.stop()
-
-
-def test_arm2_bad_grid_config_is_rejected_at_startup(tmp_path):
-    try:
-        _arm2_node(tmp_path, **{'grid.rows': 3, 'grid.cols': 3})
-        assert False, '應該要丟 ValueError'
-    except ValueError as e:
-        assert '必須等於 8' in str(e)
-
-
-# --------------------------------------------------------------------------- #
-# debug 視窗的繪圖路徑（show_debug=true）
-# --------------------------------------------------------------------------- #
-def test_debug_images_are_produced_when_show_debug_is_true(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path, show_debug=True)
-    rig = Rig(node, env_scenes['a8']).start()
-    try:
-        assert wait_until(lambda: node.get_debug_image() is not None and len(node._zones) == 3)
-        assert call(node, '/vision/env/capture_ranking').success      # 之後畫面上會有 rank 標示
-        time.sleep(0.4)
-        img = node.get_debug_image()
-        assert img.shape == (480, 640, 3) and img.dtype == np.uint8
-        assert not np.array_equal(img, env_scenes['a8'])              # 確實畫了東西
-    finally:
-        rig.stop()
-
-    H = plane_homography(S.ENV_ZONES['a'], *S.ZONE_SIZE_MM)
-    save_h(tmp_path, 'a_station_homography', H, 'mm')
-    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path, show_debug=True,
-                     **{'square.min_area_px': 150.0})
-    rig = Rig(arm1, env_scenes['a8']).start()
-    try:
-        assert wait_until(lambda: arm1.get_debug_image() is not None)
-        assert arm1.get_debug_image().shape == (480, 640, 3)
-    finally:
-        rig.stop()
-
-    arm2 = _arm2_node(tmp_path, show_debug=True)
-    rig = Rig(arm2, S.make_arm2_scene(ASC)).start()
-    try:
-        assert wait_until(lambda: arm2.get_debug_image() is not None)
-        img = arm2.get_debug_image()
-        assert img.shape[1] == 640 and img.shape[0] > 480            # 上：原始影像；下：校正後的格位圖
-    finally:
-        rig.stop()
-
-
-# --------------------------------------------------------------------------- #
-# Topics（service 保留不變；topic 持續廣播同一份結果）
-# --------------------------------------------------------------------------- #
 def test_env_zone_state_topic_matches_service_and_reports_image_loss(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
+    node = _env(tmp_path)
     pub = node.pubs['/vision/env/zone_state']
     rig = Rig(node, env_scenes['empty']).start()
     try:
         assert wait_until(lambda: pub.last() is not None and pub.last().valid and pub.last().b_arm_clear, 6)
-        rig.set_scene(S.make_env_scene(a_objs=S.a_objects(), c_objs=[(40, 40, 30, 0), (150, 60, 30, 20)]))
-        assert wait_until(lambda: pub.last().a_has_object and pub.last().c_object_count == 2, 4)
+        rig.set_scene(env_scenes['c3'])
+        assert wait_until(lambda: pub.last().a_has_object and pub.last().c_object_count == 3, 4)
         m = pub.last()
         assert m.header.frame_id == 'env_cam' and not m.b_has_object
-        r = call(node, '/vision/env/get_zone_state')
+        r = _zs(node)
         assert (r.a_has_object, r.b_has_object, r.b_arm_clear, r.c_object_count) == \
                (m.a_has_object, m.b_has_object, m.b_arm_clear, m.c_object_count)
 
@@ -683,118 +289,270 @@ def test_env_zone_state_topic_matches_service_and_reports_image_loss(tmp_path, e
         rig.stop()
 
 
-def test_env_ranking_topic_follows_snapshot_and_taken_marks(tmp_path, env_scenes):
-    node = make_node(env_mod.EnvVisionNode, 'env_vision_node', 'env_vision.yaml', tmp_path)
-    pub = node.pubs['/vision/env/ranking']
-    assert pub.qos.durability == 'transient_local'            # 晚訂閱者也能拿到最後一筆
-    first = pub.last()
-    assert first is not None and not first.valid and '尚未拍攝快照' in first.message
-    rig = Rig(node, env_scenes['empty']).start()
+# --------------------------------------------------------------------------- #
+# 手眼相機 1 節點（直接拿環境相機的合成影像當手眼相機畫面）
+# --------------------------------------------------------------------------- #
+T1 = np.array([[0.001, 0, 0.10], [0, 0.001, 0.05], [0, 0, 1.0]])   # A 區平面 mm -> 手臂 1 基座 m
+
+
+def _base_of(field_xy):
+    """場地座標 mm -> 期望的手臂 1 基座座標 m。"""
+    return 0.10 + (field_xy[0] - S.A_X0_MM) / 1000.0, 0.05 + field_xy[1] / 1000.0
+
+
+def _arm1(tmp_path, scene, with_h=True, **over):
+    if with_h:
+        H_plane = np.linalg.inv(S.a_plane_to_img())     # 像素 -> A 區平面 mm
+        save_h(tmp_path, 'a_station_homography', H_plane, 'mm')
+        save_h(tmp_path, 'arm1_homography', T1 @ H_plane, 'm')
+    node = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
+                     **{'cap.min_area_px': 100.0, **over})   # 合成圖裡的瓶蓋比真實手眼相機看到的小
+    return node, Rig(node, scene).start()
+
+
+def _pick(arm1, **fields):
+    return call(arm1, '/vision/arm1/get_pick_target', **fields)
+
+
+def _publish(node, topic):
+    """手動觸發節點的發布計時器（Rig 只跑處理計時器 timers[0]），回傳剛發布的訊息。"""
+    node.timers[1][1]()
+    return node.pubs[topic].msgs[-1]
+
+
+def test_arm1_picks_nearest_reachable_cap_and_echoes_rank(tmp_path, env_scenes):
+    arm1, rig = _arm1(tmp_path, env_scenes['a8'])
     try:
-        assert wait_until(lambda: len(node._zones) == 3 and node._boot_done)
-        rig.set_scene(env_scenes['a8'])
-        assert call(node, '/vision/env/capture_ranking').success
-        m = pub.last()
-        assert m.valid and m.rank == list(range(1, 9)) and m.taken == [False] * 8
-        assert len(m.x_mm) == len(m.y_mm) == len(m.side_mm) == 8
-        assert m.side_mm == sorted(m.side_mm)
-
-        x, y = S.A_POSITIONS[S.A_PERM[2]]
-        n = len(pub.msgs)
-        call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y), peek_only=True)
-        assert len(pub.msgs) == n                            # peek 不改狀態，不發布
-        assert call(node, '/vision/env/get_rank', x_mm=float(x), y_mm=float(y)).success
-        assert pub.last().taken == [False, False, True] + [False] * 5
-        call(node, '/vision/env/clear_taken')
-        assert pub.last().taken == [False] * 8
-
-        rig.set_scene(env_scenes['a7'])                       # 拍攝失敗：topic 也宣告快照無效
-        assert not call(node, '/vision/env/capture_ranking').success
-        m = pub.last()
-        assert not m.valid and '快照失敗' in m.message and m.rank == []
+        assert wait_until(lambda: _pick(arm1).success, 4)
+        r = _pick(arm1, target_rank=3)
+        ex, ey = _base_of(S.A_CAPS_MM[0])                  # (440,60)：離基座最近
+        assert r.success and r.rank == 3, r.message
+        assert abs(r.x - ex) < 0.004 and abs(r.y - ey) < 0.004 and abs(r.z - 0.01) < 1e-9
+        assert '看得到 8 個' in r.message
+        assert _pick(arm1, target_rank=0).rank == 0
+        assert not _pick(arm1, target_rank=-1).success
     finally:
         rig.stop()
 
 
-def test_arm1_detections_topic_gives_plane_and_base_coordinates(tmp_path, env_scenes):
-    env, env_rig, arm1, arm1_rig = _arm1_setup(tmp_path, env_scenes)
-    pub = arm1.pubs['/vision/arm1/detections']
+def test_arm1_prefers_a_cap_with_clearance(tmp_path):
+    crowded = [(430, 30), (460, 30)]          # 兩顆中心相距 30 mm
+    lone = (500, 150)
+    arm1, rig = _arm1(tmp_path, S.make_env_scene(a_caps=crowded + [lone]), **{'pick.min_clearance_m': 0.035})
     try:
-        assert wait_until(lambda: pub.last() is not None and pub.last().valid and pub.last().count == 8)
-        m = pub.last()
-        assert m.header.frame_id == 'arm1_cam'
-        assert m.plane_valid and m.base_valid
-        assert len(m.pixel_x) == len(m.plane_x_mm) == len(m.base_x) == 8
-        assert abs(m.base_z - 0.03) < 1e-9
-        # 每個真實物件位置都要對得到一筆偵測（平面 mm 與基座 m 一致）
-        for (x, y) in S.A_POSITIONS:
-            d = [np.hypot(px - x, py - y) for px, py in zip(m.plane_x_mm, m.plane_y_mm)]
-            i = int(np.argmin(d))
-            assert d[i] < 4.0
-            assert abs(m.base_x[i] - (0.10 + m.plane_x_mm[i] / 1000.0)) < 1e-6
-            assert abs(m.base_y[i] - (0.05 + m.plane_y_mm[i] / 1000.0)) < 1e-6
-        assert call(arm1, '/vision/arm1/get_pick_target', peek_only=True).success   # service 照常可用
-
-        arm1_rig.paused = True
-        assert wait_until(lambda: not pub.last().valid, 3)
-        assert '影像中斷' in pub.last().message
-    finally:
-        arm1_rig.stop()
-        env_rig.stop()
-
-
-def test_arm1_detections_topic_without_homography(tmp_path, env_scenes):
-    arm1 = make_node(arm1_mod.Arm1VisionNode, 'arm1_vision_node', 'arm1_vision.yaml', tmp_path,
-                     **{'square.min_area_px': 150.0})
-    pub = arm1.pubs['/vision/arm1/detections']
-    rig = Rig(arm1, env_scenes['a8']).start()
-    try:
-        assert wait_until(lambda: pub.last() is not None and pub.last().valid)
-        m = pub.last()
-        assert m.count > 0 and len(m.pixel_x) == m.count
-        assert not m.plane_valid and not m.base_valid and m.plane_x_mm == [] and m.base_x == []
-        assert '未標定' in m.message
+        assert wait_until(lambda: _pick(arm1).success, 4)
+        r = _pick(arm1)
+        ex, ey = _base_of(lone)
+        assert abs(r.x - ex) < 0.004 and abs(r.y - ey) < 0.004, r.message
+        arm1.set_param('pick.min_clearance_m', 0.0)       # 不要求淨空 -> 選最近的
+        arm1._refresh_cfg(time.monotonic() + 10)
+        r = _pick(arm1)
+        ex, ey = _base_of(crowded[0])
+        assert abs(r.x - ex) < 0.004 and abs(r.y - ey) < 0.004, r.message
     finally:
         rig.stop()
 
 
-def test_arm2_grid_state_topic_includes_order_check(tmp_path):
-    node = _arm2_node(tmp_path)
-    pub = node.pubs['/vision/arm2/grid_state']
-    rig = Rig(node, S.make_arm2_scene([28, None, 32, 34, None, 38, 40, 42])).start()
+def test_arm1_reports_reach_and_empty_failures(tmp_path, env_scenes):
+    arm1, rig = _arm1(tmp_path, env_scenes['a8'])
     try:
-        assert wait_until(lambda: pub.last() is not None and pub.last().valid)
-        m = pub.last()
-        assert m.header.frame_id == 'arm2_base'
-        assert m.occupied == [True, False, True, True, False, True, True, True] and not m.all_full
-        assert m.place_valid and abs(m.place_x[0] - 0.225) < 0.004 and abs(m.place_y[7] - (-0.025)) < 0.004
-        assert np.isnan(m.side_mm[1]) and abs(m.side_mm[0] - 28) < 2.5
-        assert m.order_checked and m.order_ok and m.wrong_slots == []
+        assert wait_until(lambda: _pick(arm1).success, 4)
+        arm1.set_param('reach.max_m', 0.1)
+        arm1._refresh_cfg(time.monotonic() + 10)
+        r = _pick(arm1)
+        assert not r.success and '超出可達範圍' in r.message
+        arm1.set_param('reach.max_m', 0.35)
+        arm1._refresh_cfg(time.monotonic() + 20)
+        rig.set_scene(env_scenes['empty'])                 # A 區沒東西
+        assert wait_until(lambda: '沒有偵測到瓶蓋' in _pick(arm1).message, 3)
+    finally:
+        rig.stop()
+
+
+def test_arm1_topics(tmp_path, env_scenes):
+    arm1, rig = _arm1(tmp_path, env_scenes['a8'])
+    try:
+        assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').success)
+        m = _publish(arm1, '/vision/arm1/pick_target')
+        ex, ey = _base_of(S.A_CAPS_MM[0])
+        assert m.header.frame_id == 'arm1_base' and m.rank == 0
+        assert abs(m.x - ex) < 0.004 and abs(m.y - ey) < 0.004
+
+        det = arm1.pubs['/vision/arm1/detections']
+        assert wait_until(lambda: det.last() is not None and det.last().valid and det.last().count == 8)
+        d = det.last()
+        assert d.plane_valid and d.base_valid and len(d.plane_x_mm) == 8 and len(d.base_x) == 8
+        got = sorted(zip(np.round(d.plane_x_mm), np.round(d.plane_y_mm)))
+        exp = sorted((x - S.A_X0_MM, y) for x, y in S.A_CAPS_MM)
+        assert all(math.hypot(g[0] - e[0], g[1] - e[1]) < 4 for g, e in zip(got, exp))
+        assert all(16 < s < 23 for s in d.side_px)        # 直徑約 19 px
+    finally:
+        rig.stop()
+
+
+def test_arm1_without_homography_or_images_fails_gracefully(tmp_path, env_scenes):
+    arm1, rig = _arm1(tmp_path, env_scenes['a8'], with_h=False, service_timeout_s=0.3)
+    rig.paused = True
+    try:
+        r = _pick(arm1)                                           # 完全沒有影像
+        assert not r.success and r.message
+        m = _publish(arm1, '/vision/arm1/pick_target')
+        assert not m.success and m.message
+        rig.paused = False
+        assert wait_until(lambda: arm1.detections.peek()[0] is not None)
+        r = _pick(arm1)                                           # 有影像但 homography 還是範本（valid=false）
+        assert not r.success and '尚未標定' in r.message
+        d = arm1.pubs['/vision/arm1/detections'].last()
+        assert d.valid and not d.plane_valid and not d.base_valid and d.count == 8   # ROI = 整張影像
+    finally:
+        rig.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 手眼相機 2 節點
+# --------------------------------------------------------------------------- #
+T2 = np.array([[0.001, 0, 0.20], [0, 0.001, -0.10], [0, 0, 1.0]])   # 場地 mm -> 手臂 2 基座 m
+
+
+def _arm2(tmp_path, scene, with_h=True, **over):
+    if with_h:
+        save_h(tmp_path, 'arm2_homography', T2 @ np.linalg.inv(S.arm2_field_to_img()), 'm')
+    node = make_node(arm2_mod.Arm2VisionNode, 'arm2_vision_node', 'arm2_vision.yaml', tmp_path, **over)
+    return node, Rig(node, scene).start()
+
+
+def _valid(node):
+    return node.results.peek()[0] is not None and node.results.peek()[0].valid
+
+
+def test_arm2_grid_state_gives_occupancy_and_place_coordinates(tmp_path):
+    node, rig = _arm2(tmp_path, S.make_arm2_scene([1, 2, 3]))
+    try:
+        assert wait_until(lambda: _valid(node))
         r = call(node, '/vision/arm2/get_grid_state')
-        assert list(r.occupied) == m.occupied and list(r.place_x) == m.place_x
-
-        rig.set_scene(S.make_arm2_scene([28, 30, 38, 34, 36, 32, 40, 42]))     # 格位 3 與 6 放錯
-        assert wait_until(lambda: pub.last().valid and pub.last().all_full and not pub.last().order_ok, 4)
-        assert pub.last().wrong_slots == [3, 6]
-
-        rig.paused = True
-        assert wait_until(lambda: not pub.last().valid, 3)
-        m = pub.last()
-        assert '影像中斷' in m.message and m.occupied == [False] * 8 and not m.place_valid
+        assert r.success, r.message
+        assert list(r.occupied) == [True, True, True, False, False, False, False, False]
+        assert not r.all_full
+        for slot in (1, 2, 8):   # 格位中心 = 方孔中心 -> 基座 = 場地 mm / 1000 + (0.20, -0.10)
+            x, y = S.SLOT_CENTERS_MM[slot - 1]
+            assert abs(r.place_x[slot - 1] - (0.20 + x / 1000)) < 0.003
+            assert abs(r.place_y[slot - 1] - (-0.10 + y / 1000)) < 0.003
+        assert all(abs(z - 0.01) < 1e-9 for z in r.place_z)
     finally:
         rig.stop()
 
 
-def test_arm2_grid_state_topic_does_not_guess_order_when_unmeasurable(tmp_path):
-    node = _arm2_node(tmp_path, with_h=False)
+def test_arm2_verify_place_checks_fill_order(tmp_path):
+    node, rig = _arm2(tmp_path, S.make_arm2_scene([1, 2]))
+    try:
+        assert wait_until(lambda: _valid(node))
+        v = call(node, '/vision/arm2/verify_place', slot=2)
+        assert v.success and v.placed and v.order_ok and list(v.wrong_slots) == [], v.message
+        assert '下一格 3' in v.message
+        v = call(node, '/vision/arm2/verify_place', slot=3)
+        assert v.success and not v.placed and v.order_ok
+
+        rig.set_scene(S.make_arm2_scene([1, 2, 4]))         # 跳過 3 號直接放 4 號
+        assert wait_until(lambda: not call(node, '/vision/arm2/verify_place', slot=4).order_ok, 4)
+        v = call(node, '/vision/arm2/verify_place', slot=4)
+        assert v.success and v.placed and list(v.wrong_slots) == [4] and '跳號' in v.message
+
+        bad = call(node, '/vision/arm2/verify_place', slot=9)
+        assert not bad.success and '1..8' in bad.message
+    finally:
+        rig.stop()
+
+
+def test_arm2_rotated_camera(tmp_path):
+    filled = [1, 4, 6]
+    node, rig = _arm2(tmp_path, S.make_arm2_scene(filled, rotation_k=1), with_h=False, view_rotation_k=1)
+    try:
+        assert wait_until(lambda: _valid(node))
+        assert node.results.peek()[0].occupied == [s in filled for s in range(1, 9)]
+        r = call(node, '/vision/arm2/get_grid_state')   # 沒有 homography：給占用但 success=false
+        assert not r.success and '尚未標定' in r.message and list(r.occupied) == [s in filled for s in range(1, 9)]
+        node.set_param('view_rotation_k', 0)              # 設錯方向：回報失敗而不是給錯的編號
+        node._refresh_cfg(time.monotonic() + 10)
+        assert wait_until(lambda: not _valid(node), 3)
+        assert 'view_rotation_k' in node.results.peek()[0].message
+    finally:
+        rig.stop()
+
+
+def test_arm2_holds_holes_briefly_when_covered_then_fails(tmp_path):
+    node, rig = _arm2(tmp_path, S.make_arm2_scene([1]), hole_hold_s=0.5, service_timeout_s=0.4)
+    try:
+        assert wait_until(lambda: _valid(node))
+        rig.set_scene(S.make_arm2_scene([1], cover_slot=5))       # 夾爪遮住孔 -> 短時間內沿用孔位
+        assert wait_until(lambda: node.results.peek()[0].held, 2)
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert r.success and '沿用' in r.message and r.occupied[0]
+        assert wait_until(lambda: not call(node, '/vision/arm2/get_grid_state').success, 3)
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert '方孔定位失敗' in r.message and list(r.occupied) == [False] * 8
+
+        rig.set_scene(S.make_arm2_scene([1]))
+        assert wait_until(lambda: call(node, '/vision/arm2/get_grid_state').success, 4)
+        rig.paused = True                                         # 影像中斷
+        time.sleep(0.7)
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert not r.success and '過期' in r.message
+    finally:
+        rig.stop()
+
+
+def test_arm2_topic_matches_service(tmp_path):
+    node, rig = _arm2(tmp_path, S.make_arm2_scene([1, 3]))
     pub = node.pubs['/vision/arm2/grid_state']
-    rig = Rig(node, S.make_arm2_scene([42, 42, None, None, None, None, None, None],
-                                      extra_objs=[(50, 25, 20, 0)])).start()
     try:
         assert wait_until(lambda: pub.last() is not None and pub.last().valid)
         m = pub.last()
-        assert m.unmeasurable_slots and not m.order_checked and not m.order_ok
-        assert not m.place_valid and m.place_x == [0.0] * 8
-        assert m.occupied[0] and m.occupied[1]
+        r = call(node, '/vision/arm2/get_grid_state')
+        assert list(m.occupied) == list(r.occupied) == [True, False, True] + [False] * 5
+        assert m.header.frame_id == 'arm2_base' and m.place_valid
+        assert np.allclose(m.place_x, r.place_x, atol=1e-3)
+        assert m.order_checked and not m.order_ok and list(m.wrong_slots) == [3]
+        assert all(math.isnan(s) for s in m.side_mm)
+        assert m.fill_ratio[0] > 0.4 and m.fill_ratio[1] < 0.02
+    finally:
+        rig.stop()
+
+
+def test_arm2_bad_config_is_rejected_at_startup(tmp_path):
+    try:
+        make_node(arm2_mod.Arm2VisionNode, 'arm2_vision_node', 'arm2_vision.yaml', tmp_path,
+                  **{'hole.margin_ratio': 0.6})
+        assert False, '應該要丟 ValueError'
+    except ValueError as e:
+        assert 'margin_ratio' in str(e)
+
+
+# --------------------------------------------------------------------------- #
+# debug 視窗的繪圖路徑（show_debug=true）
+# --------------------------------------------------------------------------- #
+def test_debug_images_are_produced_when_show_debug_is_true(tmp_path, env_scenes):
+    node = _env(tmp_path, show_debug=True)
+    rig = Rig(node, env_scenes['c3']).start()
+    try:
+        assert wait_until(lambda: node.get_debug_image() is not None and len(node._zones) == 3)
+        time.sleep(0.3)
+        img = node.get_debug_image()
+        assert img.shape == (480, 640, 3) and img.dtype == np.uint8
+        assert not np.array_equal(img, env_scenes['c3'])              # 確實畫了東西
+    finally:
+        rig.stop()
+
+    arm1, rig = _arm1(tmp_path, env_scenes['a8'], show_debug=True)
+    try:
+        assert wait_until(lambda: _pick(arm1).success)
+        time.sleep(0.2)
+        assert arm1.get_debug_image().shape == (480, 640, 3)
+    finally:
+        rig.stop()
+
+    arm2, rig = _arm2(tmp_path, S.make_arm2_scene([1]), show_debug=True)
+    try:
+        assert wait_until(lambda: arm2.get_debug_image() is not None and _valid(arm2))
+        assert arm2.get_debug_image().shape == (480, 640, 3)
     finally:
         rig.stop()

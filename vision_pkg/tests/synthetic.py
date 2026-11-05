@@ -1,60 +1,49 @@
-"""合成靜態場景（含透視、木紋桌面、噪點），供 pytest 與 hsv_tuner 離線練習使用。
+"""合成靜態場景（含透視、灰色桌面、噪點），供 pytest 與 hsv_tuner 離線練習使用。
 
 直接執行  python tests/make_test_images.py  會把這些場景輸出成 PNG 到 tests/data/。
-座標約定與正式系統一致：站台平面 mm，原點為站台左上角，x 向右、y 向下。
+
+場地（與實物一致）：60x30 cm 粉紅色泡棉板，由左至右 C | B | A 各 20x30 cm；C 區有 8 個方孔（2 行 x 4 列，
+孔底白色），場地下緣在 C 區有一塊凸出的手臂底座泡棉板。物件：藍色圓形瓶蓋，直徑 20 mm。
+座標：場地平面 mm，原點為場地左上角（C 區那一側），x 向右、y 向下（y 大 = 靠近使用者）。
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-# 顏色（BGR）。木頭色刻意做成「橘褐色」，用來驗證橘色 HSV 不會把桌面誤判成物件。
-WOOD = (86, 132, 176)
-BLUE = (200, 90, 20)
-GREEN = (60, 170, 40)
-WHITE = (235, 235, 235)
-ORANGE = (0, 128, 255)
+# 顏色（BGR）
+DESK = (182, 184, 178)       # 灰色桌面（低飽和度）
+PINK = (200, 170, 240)       # 粉紅泡棉（HSV 約 H167 S74 V240）
+WHITE = (235, 235, 235)      # 孔底白紙
+BLUE = (200, 90, 30)         # 藍色瓶蓋（HSV 約 H109 S217 V200）
 BLACK = (25, 25, 25)
 
 IMG_SIZE = (640, 480)  # (w, h)
 
-# 環境相機視角下 A/B/C 站台的影像角點 [tl,tr,br,bl]（帶一點傾斜/透視）
-ENV_ZONES: Dict[str, np.ndarray] = {
-    'a': np.float32([[50, 250], [250, 256], [246, 448], [44, 442]]),
-    'b': np.float32([[290, 40], [450, 36], [456, 196], [294, 202]]),
-    'c': np.float32([[470, 250], [620, 244], [624, 430], [466, 436]]),
-}
-ZONE_SIZE_MM = (200.0, 200.0)
-
-# 上面的舊場景（三塊不同顏色的站台）要用 color 定位模式；env_vision.yaml 預設已改成 field 模式
-LEGACY_ENV_PARAMS = {
-    'zone_locate_mode': 'color',
-    'zone_color.a': 'blue', 'zone_color.b': 'green', 'zone_color.c': 'c_zone',
-    'zone_size_mm.a': list(ZONE_SIZE_MM), 'zone_size_mm.b': list(ZONE_SIZE_MM), 'zone_size_mm.c': list(ZONE_SIZE_MM),
-    'roi_erode_px': 4,
-}
-
-# 外框場地（field 模式）：60x30 cm 黑色外框、內部白色，A|B|C 各 20x30 cm，中間有分隔線
-FIELD_CORNERS = np.float32([[40, 112], [606, 100], [612, 396], [32, 404]])   # 外框外緣 [tl,tr,br,bl]
 FIELD_SIZE_MM = (600.0, 300.0)
-FIELD_BORDER_MM = 12.0     # 外框線寬
-FIELD_DIVIDER_MM = 8.0     # 分隔線寬
-FIELD_A_OFFSET_MM = (0.0, 50.0)   # a_objects() 的座標（200x200 範圍）放進 A 區（200x300）時的位移
+ZONE_W_MM = 200.0
+A_X0_MM = 400.0                                  # A 區左緣（場地座標）
+FIELD_CORNERS = np.float32([[40, 112], [606, 100], [612, 396], [32, 404]])   # 環境相機中的場地 [tl,tr,br,bl]
+TAB_MM = [[150, 300], [210, 300], [210, 335], [150, 335]]                    # 下緣凸出的手臂底座（粉紅）
 
-# A 區 8 個物件：尺寸 mm 與旋轉角（大的角度小，避免相鄰物件互相碰到）
-A_SIZES = [20, 24, 28, 32, 36, 40, 44, 48]
-A_ANGLES = {20: 40, 24: 25, 28: 35, 32: 10, 36: 20, 40: 5, 44: 12, 48: 0}
-A_POSITIONS = [(34, 34), (100, 34), (166, 34), (34, 100), (166, 100), (34, 166), (100, 166), (166, 166)]
-A_PERM = [4, 0, 6, 2, 7, 1, 5, 3]  # 尺寸 i 放在 A_POSITIONS[A_PERM[i]]，讓排序結果與空間位置無關
+CAP_D_MM = 20.0
+HOLE_MM = 28.0
+# 8 個方孔中心（場地座標 mm），依格位 1..8：最下排（y 大）左 1、右 2，往上 3、4 …
+HOLE_COLS_X = (132.0, 166.0)
+HOLE_ROWS_Y = (207.0, 162.0, 117.0, 72.0)        # 由下往上
+SLOT_CENTERS_MM = [(x, y) for y in HOLE_ROWS_Y for x in HOLE_COLS_X]
 
-# arm2 視角下 C 站台（2 排 x 4 欄，每格 50x50 mm）
-ARM2_C = np.float32([[110, 130], [510, 126], [516, 336], [106, 340]])
-C_SIZE_MM = (200.0, 100.0)
+# A 區 8 顆瓶蓋（場地座標 mm；中間 (500,150) 空著）
+A_CAPS_MM = [(440, 60), (500, 60), (560, 60), (440, 150), (560, 150), (440, 240), (500, 240), (560, 240)]
 
-ObjSpec = Tuple[float, float, float, float]  # cx_mm, cy_mm, side_mm, angle_deg
+# 手眼相機 2：俯看 C 區（含一點 B 區），場地平面這塊矩形 -> 影像四邊形（約 2 px/mm、帶透視）
+ARM2_PLANE_MM = np.float32([[60, 30], [250, 30], [250, 250], [60, 250]])
+ARM2_IMG = np.float32([[110, 30], [530, 24], [548, 456], [96, 462]])
+
+Pt = Tuple[float, float]
 
 
 # --------------------------------------------------------------------------- #
@@ -77,31 +66,57 @@ def imwrite(path, img: np.ndarray) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 座標轉換
+# --------------------------------------------------------------------------- #
+def env_field_to_img() -> np.ndarray:
+    """場地平面 mm -> 環境相機影像像素。"""
+    W, H = FIELD_SIZE_MM
+    return cv2.getPerspectiveTransform(np.float32([[0, 0], [W, 0], [W, H], [0, H]]), FIELD_CORNERS)
+
+
+def arm2_field_to_img() -> np.ndarray:
+    """場地平面 mm -> 手眼相機 2 影像像素（未旋轉）。"""
+    return cv2.getPerspectiveTransform(ARM2_PLANE_MM, ARM2_IMG)
+
+
+def zone_corners_img(zone: str) -> np.ndarray:
+    """某區在環境相機影像中的角點 [tl,tr,br,bl]。"""
+    x0 = {'c': 0.0, 'b': ZONE_W_MM, 'a': 2 * ZONE_W_MM}[zone]
+    pts = np.float32([[x0, 0], [x0 + ZONE_W_MM, 0], [x0 + ZONE_W_MM, 300], [x0, 300]])
+    return cv2.perspectiveTransform(pts.reshape(-1, 1, 2), env_field_to_img()).reshape(-1, 2)
+
+
+def a_plane_to_img() -> np.ndarray:
+    """A 區平面 mm（原點 = A 區左上角）-> 環境相機影像像素。"""
+    return env_field_to_img() @ np.array([[1, 0, A_X0_MM], [0, 1, 0], [0, 0, 1]], np.float64)
+
+
+# --------------------------------------------------------------------------- #
 # 繪圖
 # --------------------------------------------------------------------------- #
-def plane_to_img_H(corners: np.ndarray, size_mm: Sequence[float]) -> np.ndarray:
-    w, h = size_mm
-    return cv2.getPerspectiveTransform(np.float32([[0, 0], [w, 0], [w, h], [0, h]]), np.float32(corners))
-
-
-def draw_square(img: np.ndarray, H: np.ndarray, spec: ObjSpec, color=ORANGE) -> None:
-    cx, cy, side, ang = spec
-    half = side / 2.0
-    pts = np.float32([[-half, -half], [half, -half], [half, half], [-half, half]])
-    a = np.deg2rad(ang)
-    R = np.float32([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
-    pts = pts @ R.T + np.float32([cx, cy])
-    ip = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+def _poly(img: np.ndarray, H: np.ndarray, pts_mm, color) -> None:
+    ip = cv2.perspectiveTransform(np.float32(pts_mm).reshape(-1, 1, 2), H).reshape(-1, 2)
     cv2.fillConvexPoly(img, np.round(ip).astype(np.int32), color, cv2.LINE_AA)
+
+
+def _square(c: Pt, side: float):
+    x, y = c
+    h = side / 2.0
+    return [[x - h, y - h], [x + h, y - h], [x + h, y + h], [x - h, y + h]]
+
+
+def _circle(c: Pt, d: float, n: int = 40):
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.stack([c[0] + d / 2 * np.cos(t), c[1] + d / 2 * np.sin(t)], axis=1)
 
 
 def _desk(seed: int) -> np.ndarray:
     rng = np.random.RandomState(seed)
     w, h = IMG_SIZE
     img = np.empty((h, w, 3), np.uint8)
-    img[:] = WOOD
-    grain = (np.sin(np.linspace(0, 60, h)) * 6)[:, None, None] + rng.randn(h, 1, 1) * 2
-    return np.clip(img.astype(np.float32) + grain, 0, 255).astype(np.uint8)
+    img[:] = DESK
+    shade = (np.linspace(-6, 6, w))[None, :, None] + rng.randn(h, 1, 1) * 1.5
+    return np.clip(img.astype(np.float32) + shade, 0, 255).astype(np.uint8)
 
 
 def _finish(img: np.ndarray, seed: int, sigma: float = 3.0) -> np.ndarray:
@@ -111,86 +126,41 @@ def _finish(img: np.ndarray, seed: int, sigma: float = 3.0) -> np.ndarray:
     return np.clip(noisy, 0, 255).astype(np.uint8)
 
 
-def a_objects(sizes: Optional[Sequence[float]] = None, skip: Sequence[int] = ()) -> List[ObjSpec]:
-    """A 區 8 個物件的規格（平面 mm）。skip 為要略過的「尺寸索引」。"""
-    sizes = list(A_SIZES if sizes is None else sizes)
-    out = []
-    for i, s in enumerate(sizes):
-        if i in skip:
-            continue
-        x, y = A_POSITIONS[A_PERM[i]]
-        out.append((x, y, s, A_ANGLES.get(int(round(s)), 15)))
-    return out
+def _draw_field(img: np.ndarray, H: np.ndarray, caps_mm: Sequence[Pt], filled_slots: Sequence[int],
+                arm_in_b: bool) -> None:
+    W, Hh = FIELD_SIZE_MM
+    _poly(img, H, [[0, 0], [W, 0], [W, Hh], [0, Hh]], PINK)
+    _poly(img, H, TAB_MM, PINK)
+    for c in SLOT_CENTERS_MM:
+        _poly(img, H, _square(c, HOLE_MM), WHITE)
+    for s in filled_slots:
+        _poly(img, H, _circle(SLOT_CENTERS_MM[s - 1], CAP_D_MM), BLUE)
+    for c in caps_mm:
+        _poly(img, H, _circle(c, CAP_D_MM), BLUE)
+    if arm_in_b:   # 手臂從上方伸進 B 區
+        _poly(img, H, [[230, -40], [370, -40], [370, 200], [230, 200]], BLACK)
 
 
 # --------------------------------------------------------------------------- #
 # 場景
 # --------------------------------------------------------------------------- #
-def make_env_scene(a_objs: Sequence[ObjSpec] = (), b_objs: Sequence[ObjSpec] = (),
-                   c_objs: Sequence[ObjSpec] = (), arm_in_b: bool = False, seed: int = 0,
-                   extra_draw=None) -> np.ndarray:
-    """環境相機場景：木紋桌面 + 藍(A)/綠(B)/白(C)站台 + 物件 + 可選的手臂（黑色）。"""
+def make_env_scene(a_caps: Sequence[Pt] = (), filled_slots: Sequence[int] = (), b_caps: Sequence[Pt] = (),
+                   arm_in_b: bool = False, seed: int = 0) -> np.ndarray:
+    """環境相機場景。a_caps / b_caps 為場地座標 mm；filled_slots 為 C 區已放瓶蓋的格位編號。"""
     img = _desk(seed)
-    colors = {'a': BLUE, 'b': GREEN, 'c': WHITE}
-    for name, c in ENV_ZONES.items():
-        cv2.fillConvexPoly(img, np.round(c).astype(np.int32), colors[name], cv2.LINE_AA)
-    for name, objs in (('a', a_objs), ('b', b_objs), ('c', c_objs)):
-        H = plane_to_img_H(ENV_ZONES[name], ZONE_SIZE_MM)
-        for o in objs:
-            draw_square(img, H, o)
-    if arm_in_b:  # 手臂從左側伸進 B 區，遮住約 6 成綠色
-        cv2.fillConvexPoly(img, np.int32([[270, 20], [392, 20], [392, 222], [270, 222]]), BLACK)
-    if extra_draw is not None:
-        extra_draw(img)
+    _draw_field(img, env_field_to_img(), list(a_caps) + list(b_caps), filled_slots, arm_in_b)
     return _finish(img, seed)
 
 
-def make_field_scene(a_objs: Sequence[ObjSpec] = (), b_arm: bool = False, seed: int = 0) -> np.ndarray:
-    """外框場地：木紋桌面 + 黑色外框（含兩條分隔線）+ 白色內部。a_objs 為 A 區平面座標（加上 FIELD_A_OFFSET_MM）。"""
+def make_arm2_scene(filled_slots: Sequence[int] = (), rotation_k: int = 0, seed: int = 0,
+                    extra_caps_mm: Sequence[Pt] = (), cover_slot: Optional[int] = None) -> np.ndarray:
+    """手眼相機 2 視角（俯看 C 區）。rotation_k：影像逆時針轉 k 個 90°（模擬相機裝的方向不同），
+    節點的 view_rotation_k 設成同一個 k 就能還原成使用者視角。cover_slot：用黑色手臂遮住該孔（測沿用孔位）。"""
     img = _desk(seed)
-    H = plane_to_img_H(FIELD_CORNERS, FIELD_SIZE_MM)
-    W, Hh = FIELD_SIZE_MM
-    b, d = FIELD_BORDER_MM, FIELD_DIVIDER_MM
-
-    def poly(pts_mm, color):
-        ip = cv2.perspectiveTransform(np.float32(pts_mm).reshape(-1, 1, 2), H).reshape(-1, 2)
-        cv2.fillConvexPoly(img, np.round(ip).astype(np.int32), color, cv2.LINE_AA)
-
-    poly([[0, 0], [W, 0], [W, Hh], [0, Hh]], BLACK)
-    poly([[b, b], [W - b, b], [W - b, Hh - b], [b, Hh - b]], WHITE)
-    for x in (W / 3, 2 * W / 3):
-        poly([[x - d / 2, 0], [x + d / 2, 0], [x + d / 2, Hh], [x - d / 2, Hh]], BLACK)
-    ox, oy = FIELD_A_OFFSET_MM
-    for cx, cy, side, ang in a_objs:
-        draw_square(img, H, (cx + ox, cy + oy, side, ang))
-    if b_arm:   # 手臂從上方伸進 B 區
-        poly([[230, -40], [370, -40], [370, 200], [230, 200]], BLACK)
-    return _finish(img, seed)
-
-
-def c_slot_objects(slot_sides: Sequence[Optional[float]], rows: int = 2, cols: int = 4,
-                   size_mm: Sequence[float] = C_SIZE_MM, jitter: float = 1.0, seed: int = 0) -> List[ObjSpec]:
-    """依各格邊長產生放在格中心（帶少量偏移與旋轉）的物件規格；None = 該格空著。"""
-    rng = np.random.RandomState(seed)
-    cw, ch = size_mm[0] / cols, size_mm[1] / rows
-    out = []
-    for i, s in enumerate(slot_sides):
-        if s is None:
-            continue
-        r, c = divmod(i, cols)
-        out.append(((c + 0.5) * cw + rng.uniform(-jitter, jitter), (r + 0.5) * ch + rng.uniform(-jitter, jitter),
-                    s, rng.uniform(-3, 3)))
-    return out
-
-
-def make_arm2_scene(slot_sides: Sequence[Optional[float]], rotation_k: int = 0, seed: int = 0,
-                    extra_objs: Sequence[ObjSpec] = ()) -> np.ndarray:
-    """手眼相機 2 視角的 C 區（白色站台）。rotation_k 模擬相機相對站台轉了 k*90°：
-    平面原點落在影像第 k 個角點，與 geometry.rotate_corners(corners, k) 的定義一致。"""
-    img = _desk(seed)
-    cv2.fillConvexPoly(img, np.round(ARM2_C).astype(np.int32), WHITE, cv2.LINE_AA)
-    plane_corners = np.roll(ARM2_C, -int(rotation_k), axis=0)
-    H = plane_to_img_H(plane_corners, C_SIZE_MM)
-    for o in list(c_slot_objects(slot_sides, seed=seed)) + list(extra_objs):
-        draw_square(img, H, o)
-    return _finish(img, seed)
+    H = arm2_field_to_img()
+    _draw_field(img, H, extra_caps_mm, filled_slots, False)
+    if cover_slot is not None:   # 夾爪從右邊伸進來蓋住該孔（一路延伸到影像外，不會形成封閉的洞）
+        x, y = SLOT_CENTERS_MM[cover_slot - 1]
+        _poly(img, H, [[x - 20, y - 20], [400, y - 20], [400, y + 20], [x - 20, y + 20]], BLACK)
+    img = _finish(img, seed)
+    return np.ascontiguousarray(np.rot90(img, int(rotation_k) % 4))

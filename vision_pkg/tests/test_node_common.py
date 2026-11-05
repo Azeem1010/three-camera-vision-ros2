@@ -11,7 +11,7 @@ from fake_ros import FakeClient
 from vision_pkg.node_common import (Debouncer, FlatParams, FrameBuffer, LatestValue, call_service,
                                     image_msg_to_bgr)
 from vision_pkg.vision_core.params_util import dataclass_from_flat
-from vision_pkg.vision_core.square_detect import SquareParams
+from vision_pkg.vision_core.cap_detect import CapParams
 
 
 def test_debouncer_requires_consecutive_samples():
@@ -100,20 +100,20 @@ def test_image_conversion_errors():
 
 
 def test_flat_params_reports_missing_names():
-    p = FlatParams({'a': 1, 'b': '2.5', 'c': [1, 2], 'd': 'true', 'square.min_area_px': 1.0})
+    p = FlatParams({'a': 1, 'b': '2.5', 'c': [1, 2], 'd': 'true', 'cap.min_area_px': 1.0})
     assert (p.i('a'), p.f('b'), p.fl('c'), p.b('d')) == (1, 2.5, [1.0, 2.0], True)
     with pytest.raises(KeyError, match='zzz'):
         p.f('zzz')
     with pytest.raises(KeyError, match='max_area_px'):
-        p.group(SquareParams, 'square')
+        p.group(CapParams, 'cap')
 
 
 def test_dataclass_from_flat_coerces_types():
-    flat = {'s.min_area_px': 5, 's.max_area_px': '9', 's.approx_eps_ratio': 0.04, 's.max_aspect': 1.15,
-            's.min_fill': 0.85, 's.reject_border_touch': 'true', 's.border_px': 2.0, 's.side_method': 'rect'}
-    sp = dataclass_from_flat(SquareParams, flat, 's')
-    assert sp.min_area_px == 5.0 and sp.max_area_px == 9.0 and sp.reject_border_touch is True
-    assert sp.border_px == 2 and isinstance(sp.border_px, int)
+    flat = {'s.min_area_px': 5, 's.max_area_px': '9', 's.min_circularity': 0.8,
+            's.min_fill': 0.85, 's.reject_border_touch': 'true', 's.border_px': 2.0}
+    cp = dataclass_from_flat(CapParams, flat, 's')
+    assert cp.min_area_px == 5.0 and cp.max_area_px == 9.0 and cp.reject_border_touch is True
+    assert cp.border_px == 2 and isinstance(cp.border_px, int)
 
 
 def test_call_service_success_not_ready_and_timeout():

@@ -1,5 +1,5 @@
-# /vision/env/ranking（環境相機，transient_local：快照或「已取走」標記改變時發布，晚訂閱也收得到最後一筆）
-# valid=false = 目前沒有可用快照（尚未 capture_ranking、上次拍攝失敗或站台重新定位後作廢）。
+# /vision/env/ranking（環境相機，transient_local）
+# 此場地瓶蓋大小相同、不排序：固定發布一次 valid=false，message 說明原因；以下欄位皆為空。
 std_msgs/Header header  # frame_id = env_cam
 bool valid
 string message

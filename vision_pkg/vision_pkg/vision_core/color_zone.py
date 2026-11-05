@@ -1,4 +1,4 @@
-"""HSV 分割、最大輪廓、四邊形角點、透視校正、站台占用判斷（純函式，不含 ROS）。"""
+"""HSV 分割、最大輪廓、四邊形角點、透視校正、場地定位與各區占用判斷（純函式，不含 ROS）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -37,30 +37,26 @@ class MaskParams:
 
 @dataclass(frozen=True)
 class ZoneFindParams:
-    """站台四邊形偵測參數。"""
-    min_area_px: float          # 最小色塊面積（像素²）
-    approx_eps_min: float       # approxPolyDP 的 epsilon 掃描範圍（佔周長比例）
-    approx_eps_max: float
-    approx_eps_steps: int
+    """場地外框偵測參數。"""
+    min_area_px: float          # 場地色塊最小面積（像素²）
     min_quad_fill: float        # 輪廓面積 / 四邊形面積 的下限，太低代表形狀不像矩形
-    allow_rect_fallback: bool   # approxPolyDP 湊不出 4 點時是否改用 minAreaRect
 
 
 @dataclass(frozen=True)
 class FieldParams:
-    """外框定位參數（zone_locate_mode=field：找整個場地的黑色外框，再沿長邊均分成各區）。"""
-    edge: str                   # 'outer' = 黑框外緣即場地邊界；'inner' = 黑框內緣（框內白色區域）即場地邊界
-    min_aspect: float           # 外框 寬/高 下限；場地在影像中必須是橫向（A|B|C 由左至右）
-    reverse: bool               # true = 影像中由左至右為 C|B|A
+    """場地定位參數：找出整塊場地（場地色的最大色塊），再沿長邊均分成各區。"""
+    color: str                  # 場地顏色（hsv.yaml 的名稱，預設 pink）
+    min_aspect: float           # 場地 寬/高 下限；場地在影像中必須是橫向
+    reverse: bool               # false = 影像中由左至右為 C|B|A（目前場地）；true = A|B|C
 
 
 @dataclass(frozen=True)
 class OccupancyParams:
     """站台占用 / 手臂判斷參數。"""
-    occ_ratio_thresh: float     # 站台顏色被遮擋比例 >= 此值 -> 判定有東西（主要依據）
-    orange_ratio_thresh: float  # 區內橘色比例 >= 此值 -> 判定有物件（輔助）
+    occ_ratio_thresh: float     # 場地顏色被遮擋比例 >= 此值 -> 判定有東西（主要依據）
+    object_ratio_thresh: float  # 區內物件色（瓶蓋藍）比例 >= 此值 -> 判定有物件（一顆瓶蓋就要能觸發）
     black_ratio_thresh: float   # 區內黑色比例 >= 此值 -> 視為大面積黑色（疑似手臂）
-    green_drop_ratio: float     # B 區綠色可見面積 / 基準 <= 此值 -> 視為驟降
+    visible_drop_ratio: float   # B 區場地色可見面積 / 基準 <= 此值 -> 視為驟降
 
 
 @dataclass
@@ -68,14 +64,14 @@ class ZoneResult:
     found: bool
     corners: Optional[np.ndarray]   # (4,2) float32，[tl,tr,br,bl]
     area_px: float
-    method: str                     # 'approx' | 'minrect' | ''
+    method: str                     # 'maxquad' | ''
     reason: str                     # 失敗原因（found=True 時為空）
 
 
 @dataclass
 class ZoneMetrics:
-    visible: float   # 站台顏色可見比例（ROI 內）
-    orange: float    # 橘色比例
+    visible: float   # 場地顏色可見比例（ROI 內）
+    obj: float       # 物件色比例
     black: float     # 黑色比例
 
 
@@ -143,49 +139,6 @@ def largest_contour(mask: np.ndarray, min_area: float) -> Optional[np.ndarray]:
     return best
 
 
-def quad_from_contour(contour: np.ndarray, zp: ZoneFindParams) -> Tuple[Optional[np.ndarray], str]:
-    """以 approxPolyDP 取四邊形角點。對凸包掃描 epsilon，直到剛好 4 點且為凸；
-
-    湊不出時（allow_rect_fallback）退回 minAreaRect。回傳 (角點[tl,tr,br,bl] 或 None, 方法名稱)。
-    """
-    hull = cv2.convexHull(contour)
-    peri = cv2.arcLength(hull, True)
-    steps = max(1, int(zp.approx_eps_steps))
-    for eps in np.linspace(zp.approx_eps_min, zp.approx_eps_max, steps):
-        approx = cv2.approxPolyDP(hull, float(eps) * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            return order_corners(approx.reshape(4, 2)), 'approx'
-    if zp.allow_rect_fallback:
-        box = cv2.boxPoints(cv2.minAreaRect(hull))
-        return order_corners(box), 'minrect'
-    return None, ''
-
-
-def find_zone(bgr: np.ndarray, rng: HsvRange, mp: MaskParams, zp: ZoneFindParams,
-              extra_mask: Optional[np.ndarray] = None) -> Tuple[ZoneResult, np.ndarray]:
-    """找出單一顏色站台的四個角點。回傳 (結果, 顏色遮罩)；遮罩供 debug 使用。
-
-    extra_mask：與站台色「聯集」後再找輪廓的遮罩。站台上已放了物件時（例如 C 區放滿橘色物件），
-    貼近站台邊緣的物件會把站台色輪廓咬掉一角；把物件遮罩併進來即可還原完整外框。
-    """
-    mask = hsv_mask(bgr, rng, mp)
-    if extra_mask is not None:
-        mask = cv2.bitwise_or(mask, extra_mask)
-    c = largest_contour(mask, zp.min_area_px)
-    if c is None:
-        return ZoneResult(False, None, 0.0, '', f'找不到面積 >= {zp.min_area_px:.0f} px² 的色塊'), mask
-    quad, method = quad_from_contour(c, zp)
-    if quad is None:
-        return ZoneResult(False, None, 0.0, '', 'approxPolyDP 無法取得 4 個角點'), mask
-    area_c = float(cv2.contourArea(c))
-    area_q = polygon_area(quad)
-    fill = area_c / area_q if area_q > 0 else 0.0
-    if fill < zp.min_quad_fill:
-        return ZoneResult(False, None, area_c, method,
-                          f'色塊不像矩形（輪廓/四邊形面積比 {fill:.2f} < {zp.min_quad_fill:.2f}）'), mask
-    return ZoneResult(True, quad, area_c, method, ''), mask
-
-
 def fuse_corners(corner_list: Sequence[np.ndarray], min_count: int) -> Optional[np.ndarray]:
     """多張影格的角點取逐點中位數（抗雜訊）。有效影格數不足 min_count 回傳 None。"""
     if len(corner_list) < max(1, int(min_count)):
@@ -213,40 +166,41 @@ def warp_to_plane(bgr: np.ndarray, corners: np.ndarray, width_mm: float, height_
 # --------------------------------------------------------------------------- #
 # 占用判斷
 # --------------------------------------------------------------------------- #
-def compute_zone_metrics(color_mask: np.ndarray, orange_mask: np.ndarray, black_mask: np.ndarray,
+def compute_zone_metrics(color_mask: np.ndarray, obj_mask: np.ndarray, black_mask: np.ndarray,
                          roi_mask: np.ndarray, roi_area: int) -> ZoneMetrics:
-    """在 ROI（多邊形遮罩）內統計 站台色 / 橘色 / 黑色 的面積比例。"""
+    """在 ROI（多邊形遮罩）內統計 場地色 / 物件色 / 黑色 的面積比例。"""
     area = float(max(1, roi_area))
 
     def ratio(m: np.ndarray) -> float:
         return cv2.countNonZero(cv2.bitwise_and(m, roi_mask)) / area
 
-    return ZoneMetrics(ratio(color_mask), ratio(orange_mask), ratio(black_mask))
+    return ZoneMetrics(ratio(color_mask), ratio(obj_mask), ratio(black_mask))
 
 
 def occlusion_ratio(visible: float, baseline: float) -> float:
-    """站台顏色被遮擋的比例（0 = 完全可見，1 = 全被遮擋）。baseline 為桌面淨空時的可見比例。"""
+    """場地顏色被遮擋的比例（0 = 完全可見，1 = 全被遮擋）。baseline 為場地淨空時的可見比例。"""
     return float(np.clip(1.0 - visible / max(baseline, 1e-6), 0.0, 1.0))
 
 
 def judge_object_present(m: ZoneMetrics, baseline: float, p: OccupancyParams) -> Tuple[bool, str]:
     """區內是否有物件。
 
-    以「站台顏色被遮擋」為主、「區內橘色」為輔；大面積黑色而沒有橘色時視為手臂而非物件。
+    以「區內物件色」與「場地顏色被遮擋」判斷；大面積黑色而沒有物件色時視為手臂而非物件。
+    瓶蓋很小（直徑 20 mm 只佔 20x30 cm 區域約 0.5%），所以物件色比例是主要依據。
     """
     occ = occlusion_ratio(m.visible, baseline)
     primary = occ >= p.occ_ratio_thresh
-    support = m.orange >= p.orange_ratio_thresh
+    support = m.obj >= p.object_ratio_thresh
     arm_like = m.black >= p.black_ratio_thresh
     present = (primary or support) and not (arm_like and not support)
-    return present, f'occ={occ:.2f} orange={m.orange:.3f} black={m.black:.2f}'
+    return present, f'occ={occ:.2f} obj={m.obj:.4f} black={m.black:.2f}'
 
 
 def judge_arm_present(m: ZoneMetrics, baseline: float, p: OccupancyParams) -> Tuple[bool, str]:
-    """B 區是否有手臂：綠色可見面積相對基準驟降，且出現大面積黑色。"""
+    """B 區是否有手臂：場地色可見面積相對基準驟降，且出現大面積黑色。"""
     keep = m.visible / max(baseline, 1e-6)
-    arm = keep <= p.green_drop_ratio and m.black >= p.black_ratio_thresh
-    return arm, f'green_keep={keep:.2f} black={m.black:.2f}'
+    arm = keep <= p.visible_drop_ratio and m.black >= p.black_ratio_thresh
+    return arm, f'visible_keep={keep:.2f} black={m.black:.2f}'
 
 
 def count_blobs(mask: np.ndarray, min_area_px: float) -> int:
@@ -256,12 +210,12 @@ def count_blobs(mask: np.ndarray, min_area_px: float) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# 站台 ROI、開機定位、逐區量測（env_vision_node 使用）
+# 各區 ROI、開機定位、逐區量測（env_vision_node 使用）
 # --------------------------------------------------------------------------- #
 @dataclass
 class ZoneRoi:
     corners: np.ndarray     # (4,2) tl,tr,br,bl
-    mask: np.ndarray        # 站台多邊形遮罩（已內縮），uint8 0/255
+    mask: np.ndarray        # 區域多邊形遮罩（已內縮），uint8 0/255
     area: int               # 遮罩內像素數
 
 
@@ -274,40 +228,13 @@ def make_roi(shape_hw, corners: np.ndarray, erode_px: int) -> ZoneRoi:
 class LocateResult:
     ok: bool
     corners: Optional[np.ndarray]
-    baseline: float          # 淨空時站台顏色佔 ROI 的比例（之後用來換算「被遮擋比例」）
+    baseline: float          # 淨空時場地色佔 ROI 的比例（之後用來換算「被遮擋比例」）
     message: str
-
-
-def locate_zones(frames: Sequence[np.ndarray], zone_ranges: Dict[str, HsvRange], mp: MaskParams,
-                 zp: ZoneFindParams, min_detections: int, roi_erode_px: int,
-                 min_baseline: float) -> Dict[str, LocateResult]:
-    """用多張影格（桌面淨空）逐區定位站台：角點取逐點中位數，並算出基準可見比例。
-
-    每個站台獨立判斷成功與否，失敗的站台 ok=False 並附原因（呼叫端可改用上次存檔）。
-    """
-    out: Dict[str, LocateResult] = {}
-    for name, rng in zone_ranges.items():
-        found, reasons = [], []
-        for f in frames:
-            zr, _ = find_zone(f, rng, mp, zp)
-            if zr.found:
-                found.append(zr.corners)
-            else:
-                reasons.append(zr.reason)
-        corners = fuse_corners(found, min_detections)
-        if corners is None:
-            why = reasons[0] if reasons else '無影格'
-            out[name] = LocateResult(False, None, 0.0,
-                                     f'{len(found)}/{len(frames)} 張偵測到（至少需 {min_detections}）：{why}')
-            continue
-        out[name] = _with_baseline(frames, corners, rng, mp, roi_erode_px, min_baseline,
-                                   f'{len(found)}/{len(frames)} 張')
-    return out
 
 
 def _with_baseline(frames: Sequence[np.ndarray], corners: np.ndarray, rng: HsvRange, mp: MaskParams,
                    roi_erode_px: int, min_baseline: float, note: str) -> LocateResult:
-    """算出淨空時站台顏色佔 ROI 的基準比例；太低代表 HSV 不對或有東西遮擋。"""
+    """算出淨空時場地色佔 ROI 的基準比例；太低代表 HSV 不對或有東西遮擋。"""
     roi = make_roi(frames[0].shape, corners, roi_erode_px)
     vis = [cv2.countNonZero(cv2.bitwise_and(hsv_mask(f, rng, mp), roi.mask)) / max(1, roi.area)
            for f in frames]
@@ -315,52 +242,67 @@ def _with_baseline(frames: Sequence[np.ndarray], corners: np.ndarray, rng: HsvRa
     if baseline < min_baseline:
         return LocateResult(False, corners, baseline,
                             f'淨空基準可見比例 {baseline:.2f} < {min_baseline:.2f}'
-                            '（HSV 設定不對，或站台上有東西遮擋，請淨空後重試）')
+                            '（HSV 設定不對，或場地上有東西遮擋，請淨空後重試）')
     return LocateResult(True, corners, baseline, f'ok（{note}，基準 {baseline:.2f}）')
 
 
 # --------------------------------------------------------------------------- #
-# 外框定位：整個場地一個黑色外框，沿長邊均分成 A|B|C
+# 場地定位：場地色（粉紅）的最大色塊 -> 四角點 -> 沿長邊均分成 C|B|A
 # --------------------------------------------------------------------------- #
-def find_field(bgr: np.ndarray, black: HsvRange, mp: MaskParams, zp: ZoneFindParams,
-               edge: str) -> Tuple[ZoneResult, np.ndarray]:
-    """找出場地黑色外框的四個角點。回傳 (結果, 黑色遮罩)。
+def max_area_quad(contour: np.ndarray, simplify_ratio: float = 0.005) -> Optional[np.ndarray]:
+    """從輪廓凸包的頂點中挑 4 個、使四邊形面積最大，回傳 [tl,tr,br,bl]。
 
-    edge='outer'：取最大黑色輪廓的外緣（框內有分隔線也不影響）。
-    edge='inner'：取該輪廓所有內洞（框內白色區域，有分隔線時為多個）的凸包。
+    場地邊上有小凸出物（例如手臂底座的泡棉板、邊緣的小缺口）時，approxPolyDP 會被拉歪；
+    「面積最大的內接四邊形」仍會落在真正的四個角上，因為凸出物的頂點換進來會讓面積變小。
     """
-    mask = hsv_mask(bgr, black, mp)
-    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    best, best_area = -1, float(zp.min_area_px)
-    for i, c in enumerate(cnts):
-        a = cv2.contourArea(c)
-        if hier[0][i][3] == -1 and a >= best_area:
-            best, best_area = i, a
-    if best < 0:
-        return ZoneResult(False, None, 0.0, '', f'找不到面積 >= {zp.min_area_px:.0f} px² 的黑色外框'), mask
-    if edge == 'inner':
-        holes = [cnts[i] for i in range(len(cnts))
-                 if hier[0][i][3] == best and cv2.contourArea(cnts[i]) >= 0.02 * best_area]
-        if not holes:
-            return ZoneResult(False, None, 0.0, '', '黑色外框沒有封閉的內部區域（框線有斷開？可改用 edge=outer）'), mask
-        contour = cv2.convexHull(np.vstack(holes))
-        area_c = float(sum(cv2.contourArea(h) for h in holes))
-    else:
-        contour = cnts[best]
-        area_c = float(best_area)
-    quad, method = quad_from_contour(contour, zp)
+    hull = cv2.convexHull(contour)
+    peri = cv2.arcLength(hull, True)
+    eps = simplify_ratio
+    while True:   # 頂點太多就逐步加大簡化程度（限制組合數；角點是凸包上最「尖」的點，不會被簡化掉）
+        pts = cv2.approxPolyDP(hull, max(1.0, eps * peri), True).reshape(-1, 2).astype(np.float64)
+        if len(pts) <= 16 or eps > 0.05:
+            break
+        eps *= 1.5
+    n = len(pts)
+    if n < 4:
+        return None
+    best, best_area = None, -1.0
+    # 凸包頂點已依序排列，挑 i<j<k<l 即為凸四邊形
+    for i in range(n - 3):
+        for j in range(i + 1, n - 2):
+            for k in range(j + 1, n - 1):
+                for l in range(k + 1, n):
+                    a = polygon_area(pts[[i, j, k, l]])
+                    if a > best_area:
+                        best, best_area = (i, j, k, l), a
+    return order_corners(pts[list(best)])
+
+
+def find_field(bgr: np.ndarray, field: HsvRange, mp: MaskParams, zp: ZoneFindParams) -> Tuple[ZoneResult, np.ndarray]:
+    """找出整塊場地（場地色最大色塊）的四個角點。回傳 (結果, 場地色遮罩)。
+
+    只看最外層輪廓：場地內的方孔、瓶蓋、兩塊板子的接縫都不影響外框。
+    """
+    mask = hsv_mask(bgr, field, mp)
+    c = largest_contour(mask, zp.min_area_px)
+    if c is None:
+        return ZoneResult(False, None, 0.0, '', f'找不到面積 >= {zp.min_area_px:.0f} px² 的場地色塊（HSV pink？）'), mask
+    quad = max_area_quad(c)
     if quad is None:
-        return ZoneResult(False, None, 0.0, '', 'approxPolyDP 無法取得外框的 4 個角點'), mask
+        return ZoneResult(False, None, 0.0, '', '場地輪廓無法取得 4 個角點'), mask
+    area_c = float(cv2.contourArea(c))
     area_q = polygon_area(quad)
     fill = area_c / area_q if area_q > 0 else 0.0
     if fill < zp.min_quad_fill:
-        return ZoneResult(False, None, area_c, method,
-                          f'外框不像矩形（輪廓/四邊形面積比 {fill:.2f} < {zp.min_quad_fill:.2f}）'), mask
-    return ZoneResult(True, quad, area_c, method, ''), mask
+        return ZoneResult(False, None, area_c, 'maxquad',
+                          f'場地不像矩形（輪廓/四邊形面積比 {fill:.2f} < {zp.min_quad_fill:.2f}；'
+                          '場地被大面積遮住，或有其他粉紅色物體連在場地上）'), mask
+    return ZoneResult(True, quad, area_c, 'maxquad', ''), mask
 
 
 def split_field(corners: np.ndarray, field_size_mm: Sequence[float], names: Sequence[str]) -> Dict[str, np.ndarray]:
-    """把場地四角點（tl,tr,br,bl）沿寬度方向均分成 len(names) 區，回傳各區影像角點（tl,tr,br,bl）。
+    """把場地四角點（tl,tr,br,bl）沿寬度方向均分成 len(names) 區（names 為影像中由左至右的順序），
+    回傳各區影像角點（tl,tr,br,bl）。
 
     以透視轉換在場地平面上等分，所以斜拍時各區在影像中的寬度不同也沒關係。
     """
@@ -375,19 +317,19 @@ def split_field(corners: np.ndarray, field_size_mm: Sequence[float], names: Sequ
     return out
 
 
-def locate_field_zones(frames: Sequence[np.ndarray], black: HsvRange, zone_ranges: Dict[str, HsvRange],
+def locate_field_zones(frames: Sequence[np.ndarray], field: HsvRange, names_left_to_right: Sequence[str],
                        field_mp: MaskParams, zone_mp: MaskParams, zp: ZoneFindParams, fp: FieldParams,
                        field_size_mm: Sequence[float], min_detections: int, roi_erode_px: int,
                        min_baseline: float) -> Dict[str, LocateResult]:
-    """用多張影格（桌面淨空）找場地外框，均分成各區，並算出各區基準可見比例。
+    """用多張影格（場地淨空）找場地，均分成各區，並算出各區基準可見比例。
 
-    zone_ranges 的順序即影像中由左至右的順序（fp.reverse=True 時反過來）。
-    外框找不到時所有區一起失敗；基準比例則逐區判斷。
+    names_left_to_right：fp.reverse=False 時影像中由左至右的區名（目前場地為 c, b, a）。
+    場地找不到時所有區一起失敗；基準比例則逐區判斷。
     """
-    names = list(zone_ranges)
+    names = list(names_left_to_right)
     found, reasons = [], []
     for f in frames:
-        zr, _ = find_field(f, black, field_mp, zp, fp.edge)
+        zr, _ = find_field(f, field, field_mp, zp)
         if zr.found:
             found.append(zr.corners)
         else:
@@ -395,32 +337,31 @@ def locate_field_zones(frames: Sequence[np.ndarray], black: HsvRange, zone_range
     corners = fuse_corners(found, min_detections)
     if corners is None:
         why = reasons[0] if reasons else '無影格'
-        msg = f'外框 {len(found)}/{len(frames)} 張偵測到（至少需 {min_detections}）：{why}'
+        msg = f'場地 {len(found)}/{len(frames)} 張偵測到（至少需 {min_detections}）：{why}'
         return {n: LocateResult(False, None, 0.0, msg) for n in names}
     tl, tr, br, bl = corners
     w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
     h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
     if w < fp.min_aspect * h:
-        msg = (f'外框在影像中不是橫向（寬/高 {w / max(h, 1e-6):.2f} < {fp.min_aspect:.2f}）；'
-               '請轉正環境相機，讓 A|B|C 在影像中由左至右排列')
+        msg = (f'場地在影像中不是橫向（寬/高 {w / max(h, 1e-6):.2f} < {fp.min_aspect:.2f}）；'
+               '請轉正環境相機，讓三區在影像中左右排列')
         return {n: LocateResult(False, corners, 0.0, msg) for n in names}
     zones = split_field(corners, field_size_mm, names[::-1] if fp.reverse else names)
-    note = f'外框 {len(found)}/{len(frames)} 張'
-    return {n: _with_baseline(frames, zones[n], zone_ranges[n], zone_mp, roi_erode_px, min_baseline, note)
+    note = f'場地 {len(found)}/{len(frames)} 張'
+    return {n: _with_baseline(frames, zones[n], field, zone_mp, roi_erode_px, min_baseline, note)
             for n in names}
 
 
-def measure_zones(bgr: np.ndarray, rois: Dict[str, ZoneRoi], zone_ranges: Dict[str, HsvRange],
-                  orange: HsvRange, black: HsvRange, zone_mp: MaskParams, orange_mp: MaskParams,
+def measure_zones(bgr: np.ndarray, rois: Dict[str, ZoneRoi], field: HsvRange, obj: HsvRange, black: HsvRange,
+                  zone_mp: MaskParams, obj_mp: MaskParams,
                   black_mp: MaskParams) -> Tuple[Dict[str, ZoneMetrics], np.ndarray]:
-    """一張影像內，各站台 ROI 的 站台色可見 / 橘色 / 黑色 比例。另回傳整張影像的橘色遮罩（供計數用）。"""
+    """一張影像內，各區 ROI 的 場地色可見 / 物件色 / 黑色 比例。另回傳整張影像的物件色遮罩（供計數用）。"""
     hsv_z = to_hsv(bgr, zone_mp.blur_ksize)
-    hsv_o = hsv_z if orange_mp.blur_ksize == zone_mp.blur_ksize else to_hsv(bgr, orange_mp.blur_ksize)
+    hsv_o = hsv_z if obj_mp.blur_ksize == zone_mp.blur_ksize else to_hsv(bgr, obj_mp.blur_ksize)
     hsv_k = hsv_z if black_mp.blur_ksize == zone_mp.blur_ksize else to_hsv(bgr, black_mp.blur_ksize)
-    orange_mask = mask_from_hsv(hsv_o, orange, orange_mp)
+    field_mask = mask_from_hsv(hsv_z, field, zone_mp)
+    obj_mask = mask_from_hsv(hsv_o, obj, obj_mp)
     black_mask = mask_from_hsv(hsv_k, black, black_mp)
-    metrics: Dict[str, ZoneMetrics] = {}
-    for name, roi in rois.items():
-        color_mask = mask_from_hsv(hsv_z, zone_ranges[name], zone_mp)
-        metrics[name] = compute_zone_metrics(color_mask, orange_mask, black_mask, roi.mask, roi.area)
-    return metrics, orange_mask
+    metrics = {name: compute_zone_metrics(field_mask, obj_mask, black_mask, roi.mask, roi.area)
+               for name, roi in rois.items()}
+    return metrics, obj_mask

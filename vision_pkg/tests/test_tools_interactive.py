@@ -67,15 +67,15 @@ def _argv(*args):
 def test_hsv_tuner_switches_colors_and_saves_only_what_changed(tmp_path):
     from vision_pkg.tools import hsv_tuner
     img_path = tmp_path / 'env.png'
-    S.imwrite(img_path, S.make_env_scene(a_objs=S.a_objects()))
+    S.imwrite(img_path, S.make_env_scene(a_caps=S.A_CAPS_MM))
     hsv_tuner.require_display = lambda: None
     base = calib_io.load_hsv_ranges(tmp_path)
-    script = [-1, ('set', 'H low', 8), -1, ord('s'),          # 調 orange 並存
-              ord('2'), -1,                                    # 切到 green：滑桿應換成 green 的值
+    script = [-1, ('set', 'H low', 8), -1, ord('s'),          # 調 blue 並存
+              ord('1'), -1,                                    # 切到 pink：滑桿應換成 pink 的值
               ('set', 'H high', 90), -1, ('click', 120, 90), -1, ord('m'), ord('p'),
               ord('a'),                                        # 只存「有改過」的顏色
-              ord('3'), -1, ord('1'), -1]                      # 切換但不修改 -> 不該被存
-    old = _argv('--image', str(img_path), '--color', 'orange', '--calib-dir', str(tmp_path))
+              ord('3'), -1, ord('2'), -1]                      # 切換但不修改 -> 不該被存
+    old = _argv('--image', str(img_path), '--color', 'blue', '--calib-dir', str(tmp_path))
     try:
         with FakeGui(script) as gui:
             seen = {}
@@ -83,22 +83,22 @@ def test_hsv_tuner_switches_colors_and_saves_only_what_changed(tmp_path):
 
             def spy(ms=0):
                 k = orig(ms)
-                if k == ord('2'):
+                if k == ord('1'):
                     seen['switch'] = True
-                elif seen.get('switch') and 'green_low_h' not in seen:
-                    seen['green_low_h'] = gui.trackbars['H low']
+                elif seen.get('switch') and 'pink_low_h' not in seen:
+                    seen['pink_low_h'] = gui.trackbars['H low']
                 return k
             cv2.waitKey = spy
             hsv_tuner.main()
             assert gui.frames > 5 and gui.last_view is not None
     finally:
         sys.argv = old
-    assert seen['green_low_h'] == base['green'].lower[0]       # 切色時滑桿已換成 green 的數值
+    assert seen['pink_low_h'] == base['pink'].lower[0]         # 切色時滑桿已換成 pink 的數值
     got = calib_io.load_hsv_ranges(tmp_path)
-    assert got['orange'].lower[0] == 8 and got['orange'].upper == base['orange'].upper
-    assert got['green'].upper[0] == 90
+    assert got['blue'].lower[0] == 8 and got['blue'].upper == base['blue'].upper
+    assert got['pink'].upper[0] == 90
     saved = calib_io.load_yaml(tmp_path / 'hsv.yaml')
-    assert set(saved) == {'orange', 'green'}                    # blue / c_zone / black 沒改就不寫入
+    assert set(saved) == {'blue', 'pink'}                       # black 沒改就不寫入
 
 
 def test_calibrate_homography_interactive_points_and_save(tmp_path):

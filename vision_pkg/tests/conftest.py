@@ -14,11 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent))  # 讓 import synthetic 可用
 import synthetic as S  # noqa: E402
 from make_test_images import ensure_images  # noqa: E402
 from vision_pkg.calib_io import load_hsv_ranges  # noqa: E402
-from vision_pkg.vision_core.color_zone import (MaskParams, OccupancyParams,  # noqa: E402
+from vision_pkg.vision_core.cap_detect import CapParams  # noqa: E402
+from vision_pkg.vision_core.color_zone import (FieldParams, MaskParams, OccupancyParams,  # noqa: E402
                                                ZoneFindParams)
+from vision_pkg.vision_core.holes import HoleParams  # noqa: E402
 from vision_pkg.vision_core.params_util import (dataclass_from_flat,  # noqa: E402
                                                 load_ros_params_yaml)
-from vision_pkg.vision_core.square_detect import SquareParams  # noqa: E402
 
 CONFIG = PKG_ROOT / 'config'
 
@@ -36,14 +37,12 @@ def hsv(tmp_path_factory):
 
 @pytest.fixture(scope='session')
 def env_flat():
-    """env_vision.yaml + 舊合成場景用的 color 模式覆寫（三塊彩色站台）。"""
-    return {**load_ros_params_yaml(CONFIG / 'env_vision.yaml'), **S.LEGACY_ENV_PARAMS}
+    return load_ros_params_yaml(CONFIG / 'env_vision.yaml')
 
 
 @pytest.fixture(scope='session')
-def field_flat():
-    """env_vision.yaml 原樣（field 模式：黑色外框場地）。"""
-    return load_ros_params_yaml(CONFIG / 'env_vision.yaml')
+def arm1_flat():
+    return load_ros_params_yaml(CONFIG / 'arm1_vision.yaml')
 
 
 @pytest.fixture(scope='session')
@@ -56,19 +55,33 @@ def env_cfg(env_flat):
     """env 節點相關參數物件（直接讀 config/env_vision.yaml，確保 YAML 與程式一致）。"""
     f = env_flat
     return {
+        'field': dataclass_from_flat(FieldParams, f, 'field'),
+        'field_size': tuple(f['field.size_mm']),
+        'field_mp': dataclass_from_flat(MaskParams, f, 'field_mask'),
         'zone_mp': dataclass_from_flat(MaskParams, f, 'zone_mask'),
         'zone_find': dataclass_from_flat(ZoneFindParams, f, 'zone_find'),
-        'orange_mp': dataclass_from_flat(MaskParams, f, 'orange_mask'),
+        'obj_mp': dataclass_from_flat(MaskParams, f, 'object_mask'),
         'black_mp': dataclass_from_flat(MaskParams, f, 'black_mask'),
         'occupancy': dataclass_from_flat(OccupancyParams, f, 'occupancy'),
-        'square': dataclass_from_flat(SquareParams, f, 'square'),
-        'ppm': float(f['snapshot.warp_px_per_mm']),
         'erode': int(f['roi_erode_px']),
         'min_baseline': float(f['min_baseline_ratio']),
         'min_det': int(f['boot_min_detections']),
-        'margin_px': float(f['ranker.confidence_margin_px']),
-        'match_mm': float(f['match_threshold_mm']),
-        'count_min_mm2': float(f['c_count.min_blob_area_mm2']),
+        'count_min_mm2': float(f['object_count.min_blob_area_mm2']),
+    }
+
+
+@pytest.fixture(scope='session')
+def arm1_cap(arm1_flat):
+    return dataclass_from_flat(CapParams, arm1_flat, 'cap')
+
+
+@pytest.fixture(scope='session')
+def arm2_cfg(arm2_flat):
+    f = arm2_flat
+    return {
+        'hole': dataclass_from_flat(HoleParams, f, 'hole'),
+        'field_mp': dataclass_from_flat(MaskParams, f, 'field_mask'),
+        'obj_mp': dataclass_from_flat(MaskParams, f, 'object_mask'),
     }
 
 
@@ -77,7 +90,7 @@ def env_scenes(data_dir):
     """從 tests/data 讀入的靜態 PNG（缺少時 ensure_images 會先生成）。"""
     return {
         'empty': S.imread(data_dir / 'env_empty.png'),
-        'a8': S.imread(data_dir / 'env_a_8objects.png'),
-        'a7': S.imread(data_dir / 'env_a_7objects.png'),
+        'a8': S.imread(data_dir / 'env_a_8caps.png'),
+        'c3': S.imread(data_dir / 'env_c_3caps.png'),
         'b_arm': S.imread(data_dir / 'env_b_arm.png'),
     }

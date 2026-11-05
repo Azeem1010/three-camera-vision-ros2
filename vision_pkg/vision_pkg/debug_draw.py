@@ -22,8 +22,8 @@ def draw_poly(img: np.ndarray, pts: Sequence, color: Color, thick: int = 2) -> N
     cv2.polylines(img, [p], True, color, thick, cv2.LINE_AA)
 
 
-def draw_corner_ids(img: np.ndarray, corners: np.ndarray, color: Color = (0, 255, 255)) -> None:
-    """在四角點旁標 0..3（0 = 校正後影像的左上角），用來確認 warp_rotation_k。"""
-    for i, c in enumerate(corners):
-        cv2.circle(img, (int(c[0]), int(c[1])), 4, color, -1, cv2.LINE_AA)
-        put_text(img, str(i), (c[0] + 6, c[1] - 6), color, 0.5, 1)
+def put_text_centered(img: np.ndarray, text: str, center: Tuple[float, float], color: Color = (255, 255, 255),
+                      scale: float = 0.4, thick: int = 1) -> None:
+    """以 center 為中心畫文字（用來把座標標在物件正下方/正中央）。"""
+    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    put_text(img, text, (center[0] - w / 2.0, center[1] + h / 2.0), color, scale, thick)

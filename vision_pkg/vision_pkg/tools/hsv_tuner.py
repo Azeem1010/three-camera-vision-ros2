@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """hsv_tuner：訂閱影像 topic（或讀靜態圖片），用滑桿即時調整 HSV，並分色存檔。
 
-    ros2 run vision_pkg hsv_tuner --camera env --color blue
-    ros2 run vision_pkg hsv_tuner --topic /arm1_cam/image_raw --color orange
-    python3 -m vision_pkg.tools.hsv_tuner --image tests/data/env_empty.png --color green   # 離線
+    ros2 run vision_pkg hsv_tuner --camera env --color pink
+    ros2 run vision_pkg hsv_tuner --topic /arm1_cam/image_raw --color blue
+    python3 -m vision_pkg.tools.hsv_tuner --image tests/data/env_empty.png --color pink   # 離線
 
 按鍵
-  1 blue(A 區)   2 green(B 區)   3 c_zone(C 區顏色)   4 orange(物件)   5 black(手臂)
+  1 pink(場地)   2 blue(瓶蓋)   3 black(手臂)
   s 存目前這個顏色     a 存所有「有改過」的顏色     p 印出目前數值
   m 切換顯示（遮罩 / 原圖套遮罩）     滑鼠左鍵 點畫面印出該點 HSV     q / Esc 離開
 存檔位置：<calib_dir>/hsv.yaml（逐色覆寫套件預設 config/hsv.yaml）。
@@ -28,7 +28,8 @@ from vision_pkg.debug_draw import put_text
 from vision_pkg.tools.common import add_source_args, open_source, require_display, strip_ros_args
 from vision_pkg.vision_core.color_zone import HsvRange, in_range_hsv, to_hsv
 
-KEYS = {ord('1'): 'blue', ord('2'): 'green', ord('3'): 'c_zone', ord('4'): 'orange', ord('5'): 'black'}
+COLORS = ['pink', 'blue', 'black']
+KEYS = {ord(str(i + 1)): c for i, c in enumerate(COLORS)}
 BARS = [('H low', 179), ('H high', 179), ('S low', 255), ('S high', 255), ('V low', 255), ('V high', 255)]
 WIN = 'hsv_tuner'
 
@@ -41,7 +42,7 @@ def main():
     ap = argparse.ArgumentParser(description='HSV 即時調整工具', formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     add_source_args(ap, 'env')
-    ap.add_argument('--color', choices=['blue', 'green', 'c_zone', 'orange', 'black'], default='orange',
+    ap.add_argument('--color', choices=COLORS, default='blue',
                     help='一開始要調哪個顏色')
     ap.add_argument('--blur', type=int, default=5, help='預覽用高斯模糊核（0 = 不模糊；請與 config 的 *_mask.blur_ksize 一致）')
     ap.add_argument('--scale', type=float, default=0.6, help='視窗縮放比例')
@@ -98,7 +99,7 @@ def main():
                            f'V {rng.lower[2]}-{rng.upper[2]}  cover {cov:.1f}%'
                            + ('  (hue wrap)' if rng.lower[0] > rng.upper[0] else '')
                            + ('  *unsaved*' if rng != saved[current] else ''), (8, 18), (0, 255, 255), 0.5, 1)
-            put_text(left, 'keys: 1 blue 2 green 3 c_zone 4 orange 5 black | s save | a save all | m view | q quit',
+            put_text(left, 'keys: 1 pink 2 blue 3 black | s save | a save all | m view | q quit',
                      (8, frame.shape[0] - 8), (255, 255, 255), 0.45, 1)
             if state['click'] is not None:
                 cx, cy = int(state['click'][0] / args.scale), int(state['click'][1] / args.scale)
