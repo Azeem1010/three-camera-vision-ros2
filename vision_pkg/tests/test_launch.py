@@ -75,7 +75,8 @@ def _setup(tmp_path, **values):
     try:
         m = _load_launch_module(saved)
         _LC.values = {'env_cam_device': '', 'arm1_cam_device': '', 'arm2_cam_device': '', 'show_debug': 'true',
-                      'calib_dir': str(tmp_path), 'undistort': '', 'respawn': 'true'}
+                      'calib_dir': str(tmp_path), 'undistort': '', 'respawn': 'true',
+                      'env_cam_rotate': '', 'arm1_cam_rotate': '', 'arm2_cam_rotate': ''}
         _LC.values.update(values)
         return m, m._launch_setup(None)
     finally:
@@ -142,3 +143,30 @@ def test_vision_node_parameters_show_debug_calib_dir_and_undistort(tmp_path):
         assert n.respawn is False
     m, actions = _setup(tmp_path)                                  # undistort 留空 -> 沿用各節點 YAML
     assert all('undistort' not in n.parameters[1] for n in _nodes(actions))
+
+
+def test_rotate_inserts_image_rotate_node_and_remaps_usb_cam(tmp_path):
+    dev = tmp_path / 'cam1'
+    dev.write_text('', encoding='utf-8')
+    # cameras.yaml 的 arm1_cam.rotate = 180
+    m, actions = _setup(tmp_path, arm1_cam_device=str(dev))
+    nodes = [n for n in _nodes(actions) if getattr(n, 'namespace', None) == 'arm1_cam']
+    cam = [n for n in nodes if n.package == 'usb_cam'][0]
+    rot = [n for n in nodes if n.executable == 'image_rotate_node']
+    assert cam.remappings[0] == ('image_raw', 'image_raw_unrotated')
+    assert ('image_raw/compressed', 'image_raw_unrotated/compressed') in cam.remappings
+    assert len(rot) == 1 and rot[0].parameters == [{'rotate_deg': 180}]
+    # launch 參數優先：0 = 不旋轉、不加節點、不 remap
+    m, actions = _setup(tmp_path, arm1_cam_device=str(dev), arm1_cam_rotate='0')
+    nodes = [n for n in _nodes(actions) if getattr(n, 'namespace', None) == 'arm1_cam']
+    assert not [n for n in nodes if n.executable == 'image_rotate_node']
+    assert [n for n in nodes if n.package == 'usb_cam'][0].remappings == []
+
+
+def test_invalid_rotate_is_reported_and_ignored(tmp_path):
+    dev = tmp_path / 'cam1'
+    dev.write_text('', encoding='utf-8')
+    m, actions = _setup(tmp_path, arm1_cam_device=str(dev), arm1_cam_rotate='45')
+    assert not [n for n in _nodes(actions) if n.executable == 'image_rotate_node']
+    err = '\n'.join(a.msg for a in actions if isinstance(a, _LogInfo))
+    assert 'rotate' in err and '45' in err

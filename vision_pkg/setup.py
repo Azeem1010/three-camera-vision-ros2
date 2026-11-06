@@ -30,10 +30,12 @@ setup(
             'env_vision_node = vision_pkg.env_vision_node:main',
             'arm1_vision_node = vision_pkg.arm1_vision_node:main',
             'arm2_vision_node = vision_pkg.arm2_vision_node:main',
+            'image_rotate_node = vision_pkg.image_rotate_node:main',   # 鏡頭裝反時旋轉影像
             # 工具程式
             'hsv_tuner = vision_pkg.tools.hsv_tuner:main',
             'calibrate_intrinsics = vision_pkg.tools.calibrate_intrinsics:main',
             'calibrate_homography = vision_pkg.tools.calibrate_homography:main',
+            'calibrate_caps = vision_pkg.tools.calibrate_caps:main',   # 瓶蓋+尺量標定 arm1_homography
         ],
     },
 )

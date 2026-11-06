@@ -33,7 +33,7 @@
       close_ksize: 7
     cap:                        # 單位：手眼相機原始影像像素（待實測；瓶蓋在影像中的大小隨相機高度而異）
       min_area_px: 300.0
-      max_area_px: 12000.0
+      max_area_px: 30000.0      # 目前手眼相機 1（Sonix，Home_A）瓶蓋約 134px、面積約 1.4 萬；換鏡頭後重調
       min_circularity: 0.75     # 手眼相機有透視，圓會變橢圓，比環境相機放寬
       min_fill: 0.65
       reject_border_touch: true

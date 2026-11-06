@@ -6,10 +6,16 @@
 # 也可以改用 launch 參數覆寫（優先於本檔）：
 #   ros2 launch vision_pkg vision.launch.py env_cam_device:=/dev/v4l/by-id/... \
 #       arm1_cam_device:=/dev/v4l/by-id/... arm2_cam_device:=/dev/v4l/by-id/...
+# rotate：鏡頭裝反時把影像順時針轉幾度（0/90/180/270）；launch 參數 <cam>_rotate:= 優先。
+#   非 0 時 launch 會加一個 image_rotate_node，視覺節點與工具看到的都是轉正後的影像。
+#   改了 rotate 之後，該鏡頭的 homography / 內參都要重新標定（像素座標變了）。
 # 兩處皆留空時，launch 會印出錯誤提示並略過該鏡頭（其他鏡頭與節點照常啟動）。
 env_cam:
   video_device: ""
+  rotate: 0
 arm1_cam:
   video_device: ""
+  rotate: 180            # 手眼相機 1 裝反（上下相反），2026-11-06 實測
 arm2_cam:
   video_device: ""
+  rotate: 0

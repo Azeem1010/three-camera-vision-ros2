@@ -30,10 +30,24 @@ CAMERAS = [
     ('arm2_cam', 'arm2_cam_device', 'arm2_vision_node', 'arm2_vision.yaml'),
 ]
 LIST_CMD = 'ls /dev/v4l/by-id/'
+IMAGE_TRANSPORTS = ('compressed', 'compressedDepth', 'theora', 'zstd')
 
 
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _rotation(launch_value: str, yaml_value, cam: str, problems: list) -> int:
+    """launch 參數 <cam>_rotate（非空時優先）> cameras.yaml 的 rotate。不合法時記錄問題並回 0。"""
+    raw = str(launch_value).strip() or str(yaml_value if yaml_value is not None else 0).strip()
+    try:
+        deg = int(float(raw)) % 360
+    except ValueError:
+        deg = -1
+    if deg not in (0, 90, 180, 270):
+        problems.append(f'{cam}: rotate={raw!r} 不合法（只能 0/90/180/270），已改用 0')
+        return 0
+    return deg
 
 
 def _launch_setup(context, *args, **kwargs):
@@ -61,13 +75,24 @@ def _launch_setup(context, *args, **kwargs):
         elif not os.path.exists(device):
             problems.append(f'{cam}: 裝置不存在 {device}（相機沒插好，或路徑打錯）')
         else:
+            # usb_cam 0.8.x 會把 by-id 的相對符號連結解析成 /dev/../../videoN 而失敗，所以先轉成實際裝置路徑
             params = [str(cfg / 'usb_cam.yaml'),
-                      {'video_device': device, 'camera_name': cam, 'frame_id': cam}]
+                      {'video_device': os.path.realpath(device), 'camera_name': cam, 'frame_id': cam}]
             info = calib_io.intrinsics_path(cam, calib_dir)
             if info.exists():
                 params[1]['camera_info_url'] = f'file://{info}'
+            rotate = _rotation(arg(f'{cam}_rotate'), (cam_cfg.get(cam) or {}).get('rotate', 0), cam, problems)
+            # 需要旋轉時 usb_cam 改發布到 image_raw_unrotated，由 image_rotate_node 轉正後發布 image_raw
+            # （image_transport 的壓縮 topic 不會跟著 image_raw 的 remap 改名，要逐一指定，否則會混入未旋轉的影像）
+            remaps = ([('image_raw', 'image_raw_unrotated')] +
+                      [(f'image_raw/{t}', f'image_raw_unrotated/{t}') for t in IMAGE_TRANSPORTS]) if rotate else []
             actions.append(Node(package='usb_cam', executable='usb_cam_node_exe', namespace=cam, name='usb_cam',
-                                output='screen', parameters=params, respawn=respawn, respawn_delay=2.0))
+                                output='screen', parameters=params, remappings=remaps,
+                                respawn=respawn, respawn_delay=2.0))
+            if rotate:
+                actions.append(Node(package='vision_pkg', executable='image_rotate_node', namespace=cam,
+                                    name='image_rotate', output='screen', parameters=[{'rotate_deg': rotate}],
+                                    respawn=respawn, respawn_delay=2.0))
 
         node_params = [str(cfg / vision_yaml),
                        {'show_debug': show_debug, 'calib_dir': str(calib_dir)}]
@@ -90,6 +115,9 @@ def generate_launch_description():
         DeclareLaunchArgument('env_cam_device', default_value='', description='環境相機 /dev/v4l/by-id/ 路徑（待實測）'),
         DeclareLaunchArgument('arm1_cam_device', default_value='', description='手眼相機 1 /dev/v4l/by-id/ 路徑（待實測）'),
         DeclareLaunchArgument('arm2_cam_device', default_value='', description='手眼相機 2 /dev/v4l/by-id/ 路徑（待實測）'),
+        *[DeclareLaunchArgument(f'{cam}_rotate', default_value='',
+                                description=f'{cam} 影像順時針旋轉 0/90/180/270；空 = 沿用 config/cameras.yaml')
+          for cam, _, _, _ in CAMERAS],
         DeclareLaunchArgument('show_debug', default_value='true',
                               description='三個視覺節點是否開 debug 視窗（沒有 DISPLAY 時自動停用）'),
         DeclareLaunchArgument('calib_dir', default_value='',
