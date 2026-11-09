@@ -155,7 +155,7 @@ homography 未標定、方孔數量不對等情況，一律回 `success=false` �
 | `/vision/arm2/grid_state` | `GridState` | 每處理一張新影格 | 同 `get_grid_state`，另加各孔藍色比例與 `verify_place` 的順序檢查（`side_mm` 固定 NaN） |
 
 共通規則：每則訊息都有 `header`、`valid`、`message`（`pick_target` 用 `success`，與 service 一致）。
-`frame_id`：含基座座標的 `pick_target` / `grid_state` 為 `arm1_base` / `arm2_base`，其餘為相機名稱。`valid=false` 時只看 `message`
+`frame_id`：含基座座標的 `pick_target` / `grid_state` 為 `arm1_base_link` / `arm2_base_link`，其餘為相機光學座標系 `<env|arm1|arm2>_camera_optical_frame`（與 dual_arm_system 的 URDF / TF 一致；topic 命名空間仍是 `/<env|arm1|arm2>_cam`）。`valid=false` 時只看 `message`
 （例如「影像中斷 0.8s」「場地尚未定位」「C 區方孔定位失敗」），其餘欄位無意義；`zone_state` 無效時 `b_arm_clear` 一律 false。
 homography 未標定時座標欄位以 `plane_valid` / `base_valid` / `place_valid` 標示，不影響其他欄位。
 

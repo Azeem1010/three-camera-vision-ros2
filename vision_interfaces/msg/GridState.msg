@@ -1,6 +1,6 @@
 # /vision/arm2/grid_state（手眼相機 2，每處理一張新影格發布一次）
 # 格位 1..8（固定）：使用者視角（B 區在右）最下排左 1、右 2，往上 3、4 … 最上排 7、8；陣列第 i 項 = 格位 i+1。
-std_msgs/Header header  # frame_id = arm2_base（place_* 的座標系）
+std_msgs/Header header  # frame_id = arm2_base_link（place_* 的座標系）
 bool valid
 string message
 bool[8] occupied

@@ -50,6 +50,7 @@ from vision_pkg.vision_core.holes import (N_SLOTS, HoleLayout, HoleParams, check
                                           slot_ratios)
 
 CAM_NAME = calib_io.CAMERA_NAMES['arm2']
+CAM_FRAME = calib_io.CAMERA_FRAMES['arm2']
 
 
 @dataclass
@@ -243,7 +244,7 @@ class Arm2VisionNode(Node):
             m.wrong_slots = [int(s) for s in chk.wrong_slots]
             notes.append(chk.message)
             m.message = '；'.join(notes)
-        self.pub_grid.publish(stamp(self, m, 'arm2_base'))   # place_* 是手臂 2 基座座標
+        self.pub_grid.publish(stamp(self, m, calib_io.BASE_FRAMES['arm2']))   # place_* 是手臂 2 基座座標
 
     # ------------------------------------------------------------------ #
     def _get_result(self, resp):

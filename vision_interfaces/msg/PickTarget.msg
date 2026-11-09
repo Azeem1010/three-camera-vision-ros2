@@ -1,5 +1,5 @@
 # /vision/arm1/pick_target：手眼相機 1 目前會選中的瓶蓋（以處理頻率持續發布，選法同 get_pick_target）
-std_msgs/Header header   # stamp = 發布時間；frame_id = arm1_base
+std_msgs/Header header   # stamp = 發布時間；frame_id = arm1_base_link
 bool success             # false 時其餘數值無意義，原因見 message
 string message
 int32 rank               # 不使用（不排序），固定 0

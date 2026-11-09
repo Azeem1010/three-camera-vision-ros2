@@ -276,7 +276,7 @@ def test_env_zone_state_topic_matches_service_and_reports_image_loss(tmp_path, e
         rig.set_scene(env_scenes['c3'])
         assert wait_until(lambda: pub.last().a_has_object and pub.last().c_object_count == 3, 4)
         m = pub.last()
-        assert m.header.frame_id == 'env_cam' and not m.b_has_object
+        assert m.header.frame_id == 'env_camera_optical_frame' and not m.b_has_object
         r = _zs(node)
         assert (r.a_has_object, r.b_has_object, r.b_arm_clear, r.c_object_count) == \
                (m.a_has_object, m.b_has_object, m.b_arm_clear, m.c_object_count)
@@ -375,7 +375,7 @@ def test_arm1_topics(tmp_path, env_scenes):
         assert wait_until(lambda: _publish(arm1, '/vision/arm1/pick_target').success)
         m = _publish(arm1, '/vision/arm1/pick_target')
         ex, ey = _base_of(S.A_CAPS_MM[0])
-        assert m.header.frame_id == 'arm1_base' and m.rank == 0
+        assert m.header.frame_id == 'arm1_base_link' and m.rank == 0
         assert abs(m.x - ex) < 0.004 and abs(m.y - ey) < 0.004
 
         det = arm1.pubs['/vision/arm1/detections']
@@ -509,7 +509,7 @@ def test_arm2_topic_matches_service(tmp_path):
         m = pub.last()
         r = call(node, '/vision/arm2/get_grid_state')
         assert list(m.occupied) == list(r.occupied) == [True, False, True] + [False] * 5
-        assert m.header.frame_id == 'arm2_base' and m.place_valid
+        assert m.header.frame_id == 'arm2_base_link' and m.place_valid
         assert np.allclose(m.place_x, r.place_x, atol=1e-3)
         assert m.order_checked and not m.order_ok and list(m.wrong_slots) == [3]
         assert all(math.isnan(s) for s in m.side_mm)

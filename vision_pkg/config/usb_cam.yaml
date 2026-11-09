@@ -12,7 +12,7 @@
     video_device: ""
     framerate: 30.0
     io_method: "mmap"
-    frame_id: "env_cam"
+    frame_id: "env_camera_optical_frame"
     pixel_format: "mjpeg2rgb"       # MJPG 解碼成 rgb8
     av_device_format: "YUV422P"
     image_width: 640
@@ -35,7 +35,7 @@
     video_device: ""
     framerate: 30.0
     io_method: "mmap"
-    frame_id: "arm1_cam"
+    frame_id: "arm1_camera_optical_frame"
     pixel_format: "yuyv2rgb"        # 此鏡頭 (Sonix USB 2.0) 只支援 YUYV
     av_device_format: "YUV422P"
     image_width: 640
@@ -58,7 +58,7 @@
     video_device: ""
     framerate: 30.0
     io_method: "mmap"
-    frame_id: "arm2_cam"
+    frame_id: "arm2_camera_optical_frame"
     pixel_format: "mjpeg2rgb"
     av_device_format: "YUV422P"
     image_width: 640

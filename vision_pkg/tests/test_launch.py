@@ -112,6 +112,7 @@ def test_existing_device_starts_usb_cam_in_its_namespace(tmp_path):
     assert (cam.executable, cam.namespace, cam.name) == ('usb_cam_node_exe', 'env_cam', 'usb_cam')
     assert cam.parameters[0].endswith('usb_cam.yaml')
     assert cam.parameters[1]['video_device'] == str(dev) and cam.parameters[1]['camera_name'] == 'env_cam'
+    assert cam.parameters[1]['frame_id'] == 'env_camera_optical_frame'
     assert 'camera_info_url' not in cam.parameters[1]            # 還沒標內參
     err = '\n'.join(a.msg for a in actions if isinstance(a, _LogInfo))
     assert 'arm1_cam' in err and 'arm2_cam' in err and 'env_cam:' not in err

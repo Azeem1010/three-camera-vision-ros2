@@ -1,6 +1,6 @@
 # /vision/env/ranking（環境相機，transient_local）
 # 此場地瓶蓋大小相同、不排序：固定發布一次 valid=false，message 說明原因；以下欄位皆為空。
-std_msgs/Header header  # frame_id = env_cam
+std_msgs/Header header  # frame_id = env_camera_optical_frame
 bool valid
 string message
 bool low_confidence

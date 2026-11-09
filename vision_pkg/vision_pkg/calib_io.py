@@ -24,7 +24,11 @@ from .vision_core.color_zone import HsvRange
 from .vision_core.geometry import build_undistort_maps, undistort
 
 CALIB_ENV_VAR = 'VISION_CALIB_DIR'
-CAMERA_NAMES = {'env': 'env_cam', 'arm1': 'arm1_cam', 'arm2': 'arm2_cam'}
+CAMERA_NAMES = {'env': 'env_cam', 'arm1': 'arm1_cam', 'arm2': 'arm2_cam'}  # topic 命名空間、校正檔名
+# TF frame 名稱（header.frame_id）：與 dual_arm_system 的 URDF / 相機 TF 一致，topic 名稱不受影響
+CAMERA_FRAMES = {'env': 'env_camera_optical_frame', 'arm1': 'arm1_camera_optical_frame',
+                 'arm2': 'arm2_camera_optical_frame'}
+BASE_FRAMES = {'arm1': 'arm1_base_link', 'arm2': 'arm2_base_link'}
 
 
 # --------------------------------------------------------------------------- #

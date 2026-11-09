@@ -77,7 +77,8 @@ def _launch_setup(context, *args, **kwargs):
         else:
             # usb_cam 0.8.x 會把 by-id 的相對符號連結解析成 /dev/../../videoN 而失敗，所以先轉成實際裝置路徑
             params = [str(cfg / 'usb_cam.yaml'),
-                      {'video_device': os.path.realpath(device), 'camera_name': cam, 'frame_id': cam}]
+                      {'video_device': os.path.realpath(device), 'camera_name': cam,
+                       'frame_id': calib_io.CAMERA_FRAMES[cam.removesuffix('_cam')]}]
             info = calib_io.intrinsics_path(cam, calib_dir)
             if info.exists():
                 params[1]['camera_info_url'] = f'file://{info}'

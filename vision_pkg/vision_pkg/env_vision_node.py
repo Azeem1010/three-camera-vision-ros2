@@ -59,6 +59,7 @@ ZONES = ('a', 'b', 'c')
 LEFT_TO_RIGHT = ('c', 'b', 'a')     # 目前場地在影像中由左至右的順序（field.reverse=false）
 ZONE_BGR = {'a': (255, 128, 0), 'b': (0, 200, 0), 'c': (0, 220, 255)}
 CAM_NAME = calib_io.CAMERA_NAMES['env']
+CAM_FRAME = calib_io.CAMERA_FRAMES['env']
 NO_RANKING = '此場地瓶蓋大小相同，不排序；放置順序由 C 區格位編號 1..8 決定'
 
 
@@ -390,13 +391,13 @@ class EnvVisionNode(Node):
         m.a_has_object, m.b_has_object = bool(st.a_has_object), bool(st.b_has_object)
         m.b_arm_clear = bool(st.valid and st.b_arm_clear)   # 無效時一律保守回報「手臂還在」
         m.c_object_count = int(st.c_object_count)
-        self.pub_state.publish(stamp(self, m, CAM_NAME))
+        self.pub_state.publish(stamp(self, m, CAM_FRAME))
 
     def _publish_ranking(self) -> None:
         """此場地不排序：ranking topic 只發布一次 valid=false 與原因（transient_local，晚訂閱也收得到）。"""
         m = RankingSnapshot()
         m.valid, m.message = False, NO_RANKING
-        self.pub_ranking.publish(stamp(self, m, CAM_NAME))
+        self.pub_ranking.publish(stamp(self, m, CAM_FRAME))
 
     # ------------------------------------------------------------------ #
     # Services

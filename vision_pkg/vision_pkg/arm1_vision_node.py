@@ -47,6 +47,7 @@ from vision_pkg.vision_core.color_zone import MaskParams, hsv_mask
 from vision_pkg.vision_core.geometry import apply_homography, polygon_mask
 
 CAM_NAME = calib_io.CAMERA_NAMES['arm1']
+CAM_FRAME = calib_io.CAMERA_FRAMES['arm1']
 
 
 @dataclass
@@ -227,7 +228,7 @@ class Arm1VisionNode(Node):
     def _publish_invalid(self, message: str) -> None:
         m = PickDetections()
         m.valid, m.message = False, message
-        self.pub_det.publish(stamp(self, m, CAM_NAME))
+        self.pub_det.publish(stamp(self, m, CAM_FRAME))
 
     def _publish(self, caps: List[Cap], rejected: List[Cap]) -> None:
         c = self.cfg
@@ -258,7 +259,7 @@ class Arm1VisionNode(Node):
             notes.append('arm1_homography 未標定')
         m.base_z = (c.station_height_mm + c.object_height_mm) / 1000.0
         m.message = '；'.join(notes)
-        self.pub_det.publish(stamp(self, m, CAM_NAME))
+        self.pub_det.publish(stamp(self, m, CAM_FRAME))
 
     # ------------------------------------------------------------------ #
     def _fail(self, resp, msg: str):
@@ -292,7 +293,7 @@ class Arm1VisionNode(Node):
         try:
             msg = PickTarget()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'arm1_base'
+            msg.header.frame_id = calib_io.BASE_FRAMES['arm1']
             det, why = self.detections.wait_fresh(self.cfg.image_timeout_s, 0.0)
             if det is None:
                 msg.success, msg.message = False, f'沒有可用的影像結果: {why}'

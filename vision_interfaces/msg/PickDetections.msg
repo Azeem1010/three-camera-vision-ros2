@@ -1,6 +1,6 @@
 # /vision/arm1/detections（手眼相機 1，每處理一張新影格發布一次）
 # 各藍色瓶蓋的偵測結果與座標（瓶蓋大小相同、不排序）。
-std_msgs/Header header  # frame_id = arm1_cam
+std_msgs/Header header  # frame_id = arm1_camera_optical_frame
 bool valid
 string message
 int32 count
